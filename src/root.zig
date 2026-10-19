@@ -3,12 +3,14 @@ const build_options = @import("build_options");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-pub const page_size = build_options.page_size;
-pub const pool_frames = build_options.pool_frames;
+const page_size = build_options.page_size;
+const pool_frames = build_options.pool_frames;
 
+/// The maximum length of a key.
 pub const max_key = page_size / 16;
+/// The maximum length of a value. A buffer of this size can hold all values that `get` returns.
 pub const max_val = page_size / 8;
-pub const max_depth = 32;
+const max_depth = 32;
 
 const hdr_size = 12;
 const capacity = page_size - hdr_size;
@@ -20,10 +22,11 @@ comptime {
     std.debug.assert(page_size >= 256 and page_size <= 32768);
 }
 
-pub const meta_pgno = 0;
-pub const magic = "BPTDISK1";
+const meta_pgno = 0;
+const magic = "BPTDISK1";
 
-pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge, PoolExhausted };
+/// The errors that the tree gives, in addition to the I/O errors.
+pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge, PoolExhausted, NoSpaceLeft };
 
 fn get16(p: []const u8) u16 {
     return std.mem.readInt(u16, p[0..2], .little);
@@ -89,7 +92,6 @@ const Pool = struct {
 
     fn deinit(self: *Pool, gpa: Allocator) void {
         std.debug.assert(self.pinned() == 0);
-        self.file.close(self.io);
         gpa.free(self.mem);
     }
 
@@ -211,6 +213,18 @@ const PathEntry = struct {
     idx: usize,
 };
 
+/// The pages from the root to a leaf, which `descend` holds.
+const Path = struct {
+    entries: [max_depth]PathEntry = undefined,
+    /// The level of the leaf.
+    depth: usize = 0,
+    leaf: Page = undefined,
+
+    fn slice(self: *const Path) []const PathEntry {
+        return self.entries[0 .. self.depth + 1];
+    }
+};
+
 pub const BPTree = struct {
     pool: Pool,
     root: u32 = 0,
@@ -220,14 +234,18 @@ pub const BPTree = struct {
     held: Stack(Page, 2 * max_depth) = .{},
     /// Pages that an operation allocates before it changes the tree.
     spare: Stack(Page, max_depth + 2) = .{},
+    /// The cells of the pages that a split or a merge changes.
+    scratch: *CellList,
 
-    /// Opens the tree in `sub_path` of `dir`. If the file does not exist, it makes an empty tree.
-    pub fn init(gpa: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8) !BPTree {
-        const file = try dir.createFile(io, sub_path, .{ .read = true, .truncate = false });
-        errdefer file.close(io);
+    /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
+    /// The caller owns `file` and must keep it open until `deinit`.
+    pub fn init(gpa: Allocator, io: Io, file: Io.File) !BPTree {
         const mem = try gpa.alloc(u8, page_size * pool_frames);
         errdefer gpa.free(mem);
-        var t: BPTree = .{ .pool = .{ .io = io, .file = file, .mem = mem } };
+        const scratch = try gpa.create(CellList);
+        errdefer gpa.destroy(scratch);
+        scratch.* = .{};
+        var t: BPTree = .{ .pool = .{ .io = io, .file = file, .mem = mem }, .scratch = scratch };
 
         if (try file.length(io) == 0) {
             t.npages = 1;
@@ -241,9 +259,10 @@ pub const BPTree = struct {
         return t;
     }
 
-    /// Closes the file. Changes that `sync` did not write are lost.
+    /// Releases the memory. It does not close the file. Changes that `sync` did not write are lost.
     pub fn deinit(self: *BPTree, gpa: Allocator) void {
         self.pool.deinit(gpa);
+        gpa.destroy(self.scratch);
     }
 
     /// Writes all changed pages and the meta page, and then syncs the file.
@@ -358,36 +377,35 @@ pub const BPTree = struct {
     }
 
     /// Holds the path from the root to the leaf for `key` until `releaseHeld`.
-    fn descend(self: *BPTree, key: []const u8, path: []PathEntry, depth: *usize) !Page {
+    fn descend(self: *BPTree, key: []const u8) !Path {
         errdefer self.releaseHeld();
+        var path: Path = .{};
         var pgno = self.root;
-        var d: usize = 0;
         while (true) {
             const p = try self.getPage(pgno);
             self.held.push(p);
-            path[d].pgno = pgno;
+            const e = &path.entries[path.depth];
+            e.pgno = pgno;
             switch (p.getType()) {
                 .leaf => {
-                    depth.* = d;
-                    return p;
+                    path.leaf = p;
+                    return path;
                 },
                 .internal => {},
                 else => return error.BadFile,
             }
-            const i = p.childIndex(key);
-            path[d].idx = i;
-            pgno = p.getChild(i);
-            d += 1;
-            if (d >= max_depth) return error.BadFile;
+            e.idx = p.childIndex(key);
+            pgno = p.getChild(e.idx);
+            path.depth += 1;
+            if (path.depth >= max_depth) return error.BadFile;
         }
     }
 
     pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
-        var path: [max_depth]PathEntry = undefined;
-        var depth: usize = undefined;
-        const leaf = try self.descend(key, &path, &depth);
+        const path = try self.descend(key);
         defer self.releaseHeld();
+        const leaf = path.leaf;
         const r = leaf.search(key);
         if (r.found) {
             const val = leaf.getLeafVal(r.index);
@@ -407,10 +425,7 @@ pub const BPTree = struct {
             return false;
         }
 
-        const S = struct {
-            var cl: CellList = undefined;
-        };
-        const cl = &S.cl;
+        const cl = self.scratch;
         cl.reset();
         for (0..p.getN()) |i| {
             if (i == idx) cl.add(c);
@@ -451,19 +466,18 @@ pub const BPTree = struct {
     pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
-        var path: [max_depth]PathEntry = undefined;
-        var depth: usize = undefined;
-        const leaf = try self.descend(key, &path, &depth);
+        const path = try self.descend(key);
         defer self.releaseHeld();
+        const leaf = path.leaf;
         defer self.releaseSpares();
 
         const r = leaf.search(key);
         const old_sz = if (r.found) leaf.getCell(r.index).len + 2 else 0;
         const new_sz = 4 + key.len + val.len + 2;
         const splits = leaf.getFreeBytes() + old_sz < new_sz;
-        var spares = self.splitPages(&path, depth, splits);
+        var spares = self.splitPages(path.slice(), path.depth, splits);
         if (r.found and !splits and leaf.getUsedBytes() - old_sz + new_sz < min_fill)
-            spares = @max(spares, try self.holdSiblings(&path, depth));
+            spares = @max(spares, try self.holdSiblings(path.slice(), path.depth));
         try self.reserve(spares);
 
         // Nothing below can fail, so the tree changes completely or not at all.
@@ -472,10 +486,10 @@ pub const BPTree = struct {
             self.pool.markDirty(leaf);
         }
         var c: [4 + max_key + max_val]u8 = undefined;
-        const split = self.insertUp(&path, depth, r.index, makeLeafCell(&c, key, val));
+        const split = self.insertUp(path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
         std.debug.assert(split == splits);
         if (r.found and !split)
-            self.rebalance(&path, depth);
+            self.rebalance(path.slice(), path.depth);
     }
 
     /// The caller holds the path and the siblings, and reserves the new pages.
@@ -506,10 +520,7 @@ pub const BPTree = struct {
         const right = self.pool.pinHeld(parent.getChild(li + 1));
         const leaf = left.getType() == .leaf;
 
-        const S = struct {
-            var cl: CellList = undefined;
-        };
-        var cl = &S.cl;
+        const cl = self.scratch;
         cl.reset();
         cl.addPage(left);
         if (!leaf) {
@@ -557,31 +568,30 @@ pub const BPTree = struct {
 
     pub fn delete(self: *BPTree, key: []const u8) !bool {
         if (key.len > max_key) return error.KeyTooLarge;
-        var path: [max_depth]PathEntry = undefined;
-        var depth: usize = undefined;
-        const leaf = try self.descend(key, &path, &depth);
+        const path = try self.descend(key);
         defer self.releaseHeld();
+        const leaf = path.leaf;
         defer self.releaseSpares();
 
         const r = leaf.search(key);
         if (!r.found) return false;
         const old_sz = leaf.getCell(r.index).len + 2;
         if (leaf.getUsedBytes() - old_sz < min_fill)
-            try self.reserve(try self.holdSiblings(&path, depth));
+            try self.reserve(try self.holdSiblings(path.slice(), path.depth));
 
         // Nothing below can fail, so the tree changes completely or not at all.
         leaf.deleteCell(r.index);
         self.pool.markDirty(leaf);
-        self.rebalance(&path, depth);
+        self.rebalance(path.slice(), path.depth);
         return true;
     }
 };
 
-pub const Page = struct {
+const Page = struct {
     page: *[page_size]u8,
 
     /// Non-exhaustive, because a corrupt file can contain any byte.
-    pub const Type = enum(u8) {
+    const Type = enum(u8) {
         free = 0,
         leaf = 1,
         internal = 2,
@@ -811,14 +821,16 @@ const CellList = struct {
     }
 };
 
-fn openTestTree(dir: Io.Dir) !BPTree {
-    return .init(std.testing.allocator, std.testing.io, dir, "test.bin");
+fn createTestFile(dir: Io.Dir) !Io.File {
+    return dir.createFile(std.testing.io, "test.bin", .{ .read = true });
 }
 
 test BPTree {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var t = try openTestTree(tmp.dir);
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
 
     try t.metaWrite();
@@ -832,13 +844,16 @@ test "BPTree sync and reopen" {
     var kbuf: [16]u8 = undefined;
     var out: [max_val]u8 = undefined;
     const N = 500;
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
     {
-        var t = try openTestTree(tmp.dir);
+        var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
         defer t.deinit(std.testing.allocator);
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         try t.sync();
     }
-    var t = try openTestTree(tmp.dir);
+    // A new tree has an empty pool, so it reads all pages from the file.
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
     for (0..N) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
@@ -851,10 +866,10 @@ test "BPTree bad file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const file = try tmp.dir.createFile(io, "test.bin", .{});
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
     try file.writePositionalAll(io, "garbage!", 0);
-    file.close(io);
-    try std.testing.expectError(error.BadFile, openTestTree(tmp.dir));
+    try std.testing.expectError(error.BadFile, BPTree.init(std.testing.allocator, io, file));
 }
 
 test Page {
@@ -913,7 +928,9 @@ test Page {
 test Pool {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var t = try openTestTree(tmp.dir);
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
 
     t.npages = pool_frames + 4;
@@ -935,7 +952,9 @@ test Pool {
 test "BPTree page alloc" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var t = try openTestTree(tmp.dir);
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
 
     // open allocates the root leaf as page 1.
@@ -963,7 +982,9 @@ test "BPTree page alloc" {
 test "BPTree get" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var t = try openTestTree(tmp.dir);
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
 
     // Make a two-level tree by hand: the root holds "m", with "a" on the left and "m", "z" on the right.
@@ -995,14 +1016,13 @@ test "BPTree get" {
     const long_key: [max_key + 1]u8 = @splat('k');
     try std.testing.expectError(error.KeyTooLarge, t.get(&long_key, &buf));
 
-    var p: [max_depth]PathEntry = undefined;
-    var depth: usize = undefined;
-    _ = try t.descend("z", &p, &depth);
+    const path = try t.descend("z");
     defer t.releaseHeld();
-    try std.testing.expectEqual(1, depth);
-    try std.testing.expectEqual(t.root, p[0].pgno);
-    try std.testing.expectEqual(1, p[0].idx);
-    try std.testing.expectEqual(t.pool.pgnoOf(right), p[1].pgno);
+    try std.testing.expectEqual(1, path.depth);
+    try std.testing.expectEqual(t.root, path.entries[0].pgno);
+    try std.testing.expectEqual(1, path.entries[0].idx);
+    try std.testing.expectEqual(t.pool.pgnoOf(right), path.entries[1].pgno);
+    try std.testing.expectEqual(t.pool.pgnoOf(right), t.pool.pgnoOf(path.leaf));
     // descend holds the root and the leaf.
     try std.testing.expectEqual(2, t.pool.pinned());
 }
@@ -1048,7 +1068,9 @@ test CellList {
 test "BPTree put get delete" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var t = try openTestTree(tmp.dir);
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
 
     const N = 2000;
@@ -1110,7 +1132,9 @@ test "BPTree put get delete" {
 test "BPTree failed operation does not change the tree" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var t = try openTestTree(tmp.dir);
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
     defer t.deinit(std.testing.allocator);
 
     var kbuf: [16]u8 = undefined;
@@ -1126,12 +1150,11 @@ test "BPTree failed operation does not change the tree" {
     // so that only the path fits in the pool.
     const Pinner = struct {
         fn pinAllBut(tree: *BPTree, key: []const u8, pinned: *[pool_frames]Page) !usize {
-            var p: [max_depth]PathEntry = undefined;
-            var depth: usize = undefined;
-            _ = try tree.descend(key, &p, &depth);
+            const path = try tree.descend(key);
             defer tree.releaseHeld();
+            const p = path.slice();
             var skip: Stack(u32, 2 * max_depth) = .{};
-            for (p[0 .. depth + 1], 0..) |e, k| {
+            for (p, 0..) |e, k| {
                 skip.push(e.pgno);
                 if (k == 0) continue;
                 const parent = tree.pool.heldPage(p[k - 1].pgno);
@@ -1140,7 +1163,7 @@ test "BPTree failed operation does not change the tree" {
             }
             var count: usize = 0;
             var pg: u32 = 1;
-            while (count < pool_frames - (depth + 1)) : (pg += 1) {
+            while (count < pool_frames - p.len) : (pg += 1) {
                 if (std.mem.indexOfScalar(u32, skip.items(), pg) != null) continue;
                 pinned[count] = try tree.getPage(pg);
                 count += 1;
