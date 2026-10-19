@@ -585,6 +585,41 @@ pub const BPTree = struct {
         self.rebalance(path.slice(), path.depth);
         return true;
     }
+
+    /// Calls `visit` for each key in `lo..hi`, both inclusive. A null bound has no limit.
+    /// The key and value slices are valid only during the call to `visit`.
+    pub fn scan(
+        self: *BPTree,
+        lo: ?[]const u8,
+        hi: ?[]const u8,
+        ctx: anytype,
+        comptime visit: fn (ctx: @TypeOf(ctx), key: []const u8, val: []const u8) anyerror!void,
+    ) !usize {
+        const path = try self.descend(lo orelse "");
+        defer self.releaseHeld();
+        var leaf = path.leaf;
+        defer if (leaf.page != path.leaf.page) self.pool.unpin(leaf, .clean);
+
+        var count: usize = 0;
+        var i = if (lo) |l| leaf.search(l).index else 0;
+
+        while (true) {
+            for (i..leaf.count()) |j| {
+                const k = leaf.cellKey(j);
+                if (hi) |h| if (std.mem.lessThan(u8, h, k)) return count;
+
+                try visit(ctx, k, leaf.leafVal(j));
+                count += 1;
+            }
+            const next = leaf.link();
+            if (next == 0) return count;
+            const p = try self.getPage(next);
+            if (leaf.page != path.leaf.page) self.pool.unpin(leaf, .clean);
+            leaf = p;
+            if (leaf.kind() != .leaf) return error.BadFile;
+            i = 0;
+        }
+    }
 };
 
 const Page = struct {
@@ -1127,6 +1162,70 @@ test "BPTree put get delete" {
     defer t.pool.unpin(root, .clean);
     try std.testing.expectEqual(.leaf, root.kind());
     try std.testing.expectEqual(0, root.count());
+}
+
+test "BPTree scan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    defer t.deinit(std.testing.allocator);
+
+    // Only the odd numbers, so that a bound can fall between two keys.
+    const N = 2000;
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [16]u8 = undefined;
+    for (0..N) |i| {
+        if (i % 2 == 0) continue;
+        try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), try std.fmt.bufPrint(&vbuf, "v{d}", .{i}));
+    }
+    try std.testing.expect(t.npages > 3);
+
+    const Check = struct {
+        next: usize,
+        fn visit(self: *@This(), key: []const u8, val: []const u8) !void {
+            var kb: [16]u8 = undefined;
+            var vb: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&kb, "key{d:0>8}", .{self.next}), key);
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&vb, "v{d}", .{self.next}), val);
+            self.next += 2;
+        }
+    };
+
+    var c: Check = .{ .next = 1 };
+    try std.testing.expectEqual(N / 2, try t.scan(null, null, &c, Check.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    // Both bounds are inclusive. A bound between two keys starts or stops at the nearest key inside it.
+    c = .{ .next = 101 };
+    try std.testing.expectEqual(700, try t.scan("key00000101", "key00001499", &c, Check.visit));
+    try std.testing.expectEqual(1501, c.next);
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    c = .{ .next = 101 };
+    try std.testing.expectEqual(700, try t.scan("key00000100", "key00001500", &c, Check.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    c = .{ .next = 1001 };
+    try std.testing.expectEqual(500, try t.scan("key00001000", null, &c, Check.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    c = .{ .next = 1 };
+    try std.testing.expectEqual(0, try t.scan("key00000002", "key00000002", &c, Check.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    // An error from visit stops the scan and releases all pins.
+    const Stop = struct {
+        n: usize = 0,
+        fn visit(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.n += 1;
+            if (self.n == 600) return error.Stop;
+        }
+    };
+    var s: Stop = .{};
+    try std.testing.expectError(error.Stop, t.scan(null, null, &s, Stop.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
 }
 
 test "BPTree failed operation does not change the tree" {
