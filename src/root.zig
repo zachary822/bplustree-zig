@@ -86,8 +86,8 @@ pub const BPTree = struct {
             const root = try t.pageAlloc(.leaf);
             t.root = t.pgnoOf(root);
             t.poolUnpin(root, true);
-        } else if (!try t.metaRead()) {
-            return Error.BadFile;
+        } else {
+            try t.metaRead();
         }
 
         return t;
@@ -123,15 +123,14 @@ pub const BPTree = struct {
         try self.diskWrite(META_PGNO, &buf);
     }
 
-    fn metaRead(self: *BPTree) !bool {
+    fn metaRead(self: *BPTree) !void {
         var buf: [PAGE_SIZE]u8 = undefined;
         try self.diskRead(META_PGNO, &buf);
 
-        if (!std.mem.eql(u8, MAGIC, buf[0..MAGIC.len]) or get32(buf[8..]) != PAGE_SIZE) return false;
+        if (!std.mem.eql(u8, MAGIC, buf[0..MAGIC.len]) or get32(buf[8..]) != PAGE_SIZE) return error.BadFile;
         self.root = get32(buf[12..]);
         self.npages = get32(buf[16..]);
         self.freelist = get32(buf[20..]);
-        return true;
     }
 
     fn frameData(self: *BPTree, f: usize) []u8 {
@@ -219,16 +218,14 @@ pub const BPTree = struct {
     }
 
     fn pageAlloc(self: *BPTree, t: Page.Type) !Page {
-        var pgno: u32 = undefined;
         if (self.freelist != 0) {
-            pgno = self.freelist;
-            const p = try self.poolGet(pgno);
+            const p = try self.poolGet(self.freelist);
             std.debug.assert(p.getType() == .free);
             self.freelist = p.getLink();
             p.init(t);
             return p;
         }
-        pgno = self.npages;
+        const pgno = self.npages;
         self.npages += 1;
         errdefer self.npages -= 1;
         const p: Page = .{ .page = (try self.poolPin(pgno, false))[0..PAGE_SIZE] };
@@ -397,31 +394,28 @@ pub const BPTree = struct {
         const s = cl.chooseSplit(leaf);
         const right = self.takeSpare(p.getType());
         const right_pg = self.pgnoOf(right);
-        var sep: [MAX_KEY + 6]u8 = undefined;
-        var sep_sz: usize = undefined;
-
-        if (leaf) {
+        var sep_buf: [MAX_KEY + 6]u8 = undefined;
+        const sep = if (leaf) blk: {
             right.fill(.leaf, p.getLink(), cl, s, cl.n);
             p.fill(.leaf, right_pg, cl, 0, s);
-            const k = right.getCellKey(0);
-            sep_sz = makeInternalCell(&sep, right_pg, k);
-        } else {
+            break :blk makeInternalCell(&sep_buf, right_pg, right.getCellKey(0));
+        } else blk: {
             const mid = cl.cell[s];
             right.fill(.internal, get32(mid), cl, s + 1, cl.n);
             p.fill(.internal, p.getLink(), cl, 0, s);
-            sep_sz = makeInternalCell(&sep, right_pg, mid[6..][0..get16(mid[4..])]);
-        }
+            break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
+        };
         self.poolUnpin(right, true);
         self.poolUnpin(p, true);
 
         if (d == 0) {
             const root = self.takeSpare(.internal);
             root.setLink(pgno);
-            _ = root.insertCell(0, sep[0..sep_sz]);
+            _ = root.insertCell(0, sep);
             self.root = self.pgnoOf(root);
             self.poolUnpin(root, true);
         } else {
-            _ = self.insertUp(path, d - 1, path[d - 1].idx, sep[0..sep_sz]);
+            _ = self.insertUp(path, d - 1, path[d - 1].idx, sep);
         }
         return true;
     }
@@ -450,8 +444,7 @@ pub const BPTree = struct {
             self.markDirty(leaf);
         }
         var c: [4 + MAX_KEY + MAX_VAL]u8 = undefined;
-        const sz = makeLeafCell(&c, key, val);
-        const split = self.insertUp(&path, depth, r.index, c[0..sz]);
+        const split = self.insertUp(&path, depth, r.index, makeLeafCell(&c, key, val));
         std.debug.assert(split == splits);
         if (r.found and !split)
             self.rebalance(&path, depth);
@@ -494,8 +487,7 @@ pub const BPTree = struct {
         if (!leaf) {
             const k = parent.getCellKey(sep_idx);
             var c: [MAX_KEY + 6]u8 = undefined;
-            const sz = makeInternalCell(&c, right.getLink(), k);
-            cl.add(c[0..sz]);
+            cl.add(makeInternalCell(&c, right.getLink(), k));
         }
         cl.addPage(right);
 
@@ -513,26 +505,24 @@ pub const BPTree = struct {
 
         // split evenly
         const s = cl.chooseSplit(leaf);
-        var sep: [MAX_KEY + 6]u8 = undefined;
-        var sep_sz: usize = undefined;
+        var sep_buf: [MAX_KEY + 6]u8 = undefined;
         const right_pg = self.pgnoOf(right);
-        if (leaf) {
+        const sep = if (leaf) blk: {
             left.fill(.leaf, right_pg, cl, 0, s);
             right.fill(.leaf, right.getLink(), cl, s, cl.n);
-            const k = right.getCellKey(0);
-            sep_sz = makeInternalCell(&sep, right_pg, k);
-        } else {
+            break :blk makeInternalCell(&sep_buf, right_pg, right.getCellKey(0));
+        } else blk: {
             const mid = cl.cell[s];
             left.fill(.internal, left.getLink(), cl, 0, s);
             right.fill(.internal, get32(mid), cl, s + 1, cl.n);
-            sep_sz = makeInternalCell(&sep, right_pg, mid[6..][0..get16(mid[4..])]);
-        }
+            break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
+        };
         self.poolUnpin(left, true);
         self.poolUnpin(right, true);
         parent.deleteCell(sep_idx);
         self.poolUnpin(parent, true);
 
-        if (!self.insertUp(path, d - 1, sep_idx, sep[0..sep_sz])) {
+        if (!self.insertUp(path, d - 1, sep_idx, sep)) {
             self.rebalance(path, d - 1);
         }
     }
@@ -727,19 +717,19 @@ pub const Page = struct {
     }
 };
 
-fn makeLeafCell(out: []u8, k: []const u8, v: []const u8) usize {
+fn makeLeafCell(out: []u8, k: []const u8, v: []const u8) []u8 {
     put16(out, @intCast(k.len));
     put16(out[2..], @intCast(v.len));
     @memcpy(out[4..][0..k.len], k);
     @memcpy(out[4 + k.len ..][0..v.len], v);
-    return 4 + k.len + v.len;
+    return out[0 .. 4 + k.len + v.len];
 }
 
-fn makeInternalCell(out: []u8, child_pg: u32, k: []const u8) usize {
+fn makeInternalCell(out: []u8, child_pg: u32, k: []const u8) []u8 {
     put32(out, child_pg);
     put16(out[4..], @intCast(k.len));
     @memcpy(out[6..][0..k.len], k);
-    return 6 + k.len;
+    return out[0 .. 6 + k.len];
 }
 
 const CellList = struct {
@@ -809,7 +799,7 @@ test BPTree {
     defer t.deinit(gpa);
 
     try t.metaWrite();
-    try std.testing.expect(try t.metaRead());
+    try t.metaRead();
 }
 
 test Page {
@@ -823,10 +813,10 @@ test Page {
 
     const keys = [_][]const u8{ "delta", "alpha", "charlie", "bravo" };
     for (keys) |k| {
-        const sz = makeLeafCell(&cell, k, "value");
+        const c = makeLeafCell(&cell, k, "value");
         const r = leaf.search(k);
         try std.testing.expect(!r.found);
-        try std.testing.expect(leaf.insertCell(r.index, cell[0..sz]));
+        try std.testing.expect(leaf.insertCell(r.index, c));
     }
     try std.testing.expectEqual(4, leaf.getN());
     try std.testing.expectEqualStrings("alpha", leaf.getCellKey(0));
@@ -852,16 +842,14 @@ test Page {
     while (true) : (i += 1) {
         var kbuf: [8]u8 = undefined;
         const k = std.fmt.bufPrint(&kbuf, "k{d:0>6}", .{i}) catch unreachable;
-        const sz = makeLeafCell(&cell, k, "v");
-        if (!leaf.insertCell(leaf.search(k).index, cell[0..sz])) break;
+        if (!leaf.insertCell(leaf.search(k).index, makeLeafCell(&cell, k, "v"))) break;
     }
     try std.testing.expect(leaf.getFreeBytes() < 4 + 7 + 1 + 2);
 
     const internal: Page = .{ .page = &buf };
     internal.init(.internal);
     internal.setLink(7);
-    const sz = makeInternalCell(&cell, 9, "mid");
-    try std.testing.expect(internal.insertCell(0, cell[0..sz]));
+    try std.testing.expect(internal.insertCell(0, makeInternalCell(&cell, 9, "mid")));
     try std.testing.expectEqual(7, internal.getChild(0));
     try std.testing.expectEqual(9, internal.getChild(1));
     try std.testing.expectEqualStrings("mid", internal.getCellKey(0));
@@ -956,19 +944,15 @@ test "BPTree get" {
     // Make a two-level tree by hand: the root holds "m", with "a" on the left and "m", "z" on the right.
     var cell: [PAGE_SIZE]u8 = undefined;
     const left = try t.poolGet(t.root);
-    var sz = makeLeafCell(&cell, "a", "1");
-    try std.testing.expect(left.insertCell(0, cell[0..sz]));
+    try std.testing.expect(left.insertCell(0, makeLeafCell(&cell, "a", "1")));
 
     const right = try t.pageAlloc(.leaf);
-    sz = makeLeafCell(&cell, "m", "2");
-    try std.testing.expect(right.insertCell(0, cell[0..sz]));
-    sz = makeLeafCell(&cell, "z", "3");
-    try std.testing.expect(right.insertCell(1, cell[0..sz]));
+    try std.testing.expect(right.insertCell(0, makeLeafCell(&cell, "m", "2")));
+    try std.testing.expect(right.insertCell(1, makeLeafCell(&cell, "z", "3")));
 
     const root = try t.pageAlloc(.internal);
     root.setLink(t.pgnoOf(left));
-    sz = makeInternalCell(&cell, t.pgnoOf(right), "m");
-    try std.testing.expect(root.insertCell(0, cell[0..sz]));
+    try std.testing.expect(root.insertCell(0, makeInternalCell(&cell, t.pgnoOf(right), "m")));
     t.root = t.pgnoOf(root);
     t.poolUnpin(left, true);
     t.poolUnpin(right, true);
@@ -1006,8 +990,7 @@ test CellList {
 
     const keys = [_][]const u8{ "a", "b", "c", "d" };
     for (keys, 0..) |k, i| {
-        const sz = makeLeafCell(&cell, k, "value");
-        try std.testing.expect(p.insertCell(i, cell[0..sz]));
+        try std.testing.expect(p.insertCell(i, makeLeafCell(&cell, k, "value")));
     }
 
     var cl: CellList = .{};
@@ -1031,8 +1014,7 @@ test CellList {
     q.init(.internal);
     for (keys, 0..) |k, i| {
         var tmp: [16]u8 = undefined;
-        const sz = makeInternalCell(&tmp, @intCast(i + 10), k);
-        try std.testing.expect(q.insertCell(i, tmp[0..sz]));
+        try std.testing.expect(q.insertCell(i, makeInternalCell(&tmp, @intCast(i + 10), k)));
     }
     cl.addPage(q);
     try std.testing.expectEqual(1, cl.chooseSplit(false));
