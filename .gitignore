@@ -1,0 +1,14 @@
+# Zig build cache and output
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+*.bin
