@@ -13,6 +13,8 @@ pub const MAX_DEPTH = 32;
 const HDR = 12;
 const CAPACITY = PAGE_SIZE - HDR;
 const MIN_FILL = CAPACITY / 4;
+/// The largest separator cell, with its slot, that a split sends to a parent.
+const MAX_SEP = MAX_KEY + 6 + 2;
 
 comptime {
     std.debug.assert(PAGE_SIZE >= 256 and PAGE_SIZE <= 32768);
@@ -21,7 +23,7 @@ comptime {
 pub const META_PGNO = 0;
 pub const MAGIC = "BPTDISK1";
 
-pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge };
+pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge, PoolExhausted };
 
 fn get16(p: []const u8) u16 {
     return std.mem.readInt(u16, p[0..2], .little);
@@ -63,6 +65,12 @@ pub const BPTree = struct {
     tick: u64 = 0,
     reads: u64 = 0,
     writes: u64 = 0,
+    /// Pages that an operation keeps pinned, so that a later access to them does no I/O.
+    held: [2 * MAX_DEPTH]Page = undefined,
+    nheld: usize = 0,
+    /// Pages that an operation allocates before it changes the tree.
+    spare: [MAX_DEPTH + 2]Page = undefined,
+    nspare: usize = 0,
 
     pub fn init(gpa: Allocator, io: Io, path: []const u8) !BPTree {
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
@@ -142,7 +150,7 @@ pub const BPTree = struct {
             if (fr.pins == 0 and (victim == null or fr.last_used < self.frames[victim.?].last_used))
                 victim = f;
         }
-        const best = victim orelse unreachable;
+        const best = victim orelse return error.PoolExhausted;
         const fr = &self.frames[best];
         if (fr.dirty) try self.diskWrite(fr.pgno, self.frameData(best));
         fr.used = false;
@@ -222,6 +230,7 @@ pub const BPTree = struct {
         }
         pgno = self.npages;
         self.npages += 1;
+        errdefer self.npages -= 1;
         const p: Page = .{ .page = (try self.poolPin(pgno, false))[0..PAGE_SIZE] };
         p.init(t);
         return p;
@@ -235,11 +244,106 @@ pub const BPTree = struct {
         self.poolUnpin(p, true);
     }
 
+    /// Pins a page that an operation holds. It does no I/O, so it cannot fail.
+    fn poolGetPinned(self: *BPTree, pgno: u32) Page {
+        const p = self.heldPage(pgno);
+        const fr = &self.frames[self.frameOf(p.page)];
+        fr.pins += 1;
+        self.tick += 1;
+        fr.last_used = self.tick;
+        return p;
+    }
+
+    /// Gives a page that an operation holds, without a change to its pins.
+    fn heldPage(self: *BPTree, pgno: u32) Page {
+        for (0..POOL_FRAMES) |f| {
+            const fr = &self.frames[f];
+            if (fr.used and fr.pgno == pgno) {
+                std.debug.assert(fr.pins > 0);
+                return .{ .page = self.frameData(f)[0..PAGE_SIZE] };
+            }
+        }
+        @panic("page is not held");
+    }
+
+    fn markDirty(self: *BPTree, p: Page) void {
+        self.frames[self.frameOf(p.page)].dirty = true;
+    }
+
+    fn hold(self: *BPTree, p: Page) void {
+        self.held[self.nheld] = p;
+        self.nheld += 1;
+    }
+
+    fn releaseHeld(self: *BPTree) void {
+        while (self.nheld > 0) {
+            self.nheld -= 1;
+            self.poolUnpin(self.held[self.nheld], false);
+        }
+    }
+
+    /// Allocates `n` pages before an operation changes the tree. `takeSpare` then gives them out without I/O.
+    fn reserve(self: *BPTree, n: usize) !void {
+        for (0..n) |_| {
+            self.spare[self.nspare] = try self.pageAlloc(.free);
+            self.nspare += 1;
+        }
+    }
+
+    fn takeSpare(self: *BPTree, t: Page.Type) Page {
+        std.debug.assert(self.nspare > 0);
+        self.nspare -= 1;
+        const p = self.spare[self.nspare];
+        p.init(t);
+        return p;
+    }
+
+    /// Frees the spare pages that the operation did not use. The reverse order puts the freelist back as it was.
+    fn releaseSpares(self: *BPTree) void {
+        while (self.nspare > 0) {
+            self.nspare -= 1;
+            self.pageFree(self.spare[self.nspare]);
+        }
+    }
+
+    /// The maximum number of new pages that a chain of splits needs when level `d` gets a cell.
+    fn splitPages(self: *BPTree, path: []const PathEntry, d: usize, splits: bool) usize {
+        if (!splits) return 0;
+        var n: usize = 1;
+        var k = d;
+        while (k > 0) {
+            k -= 1;
+            if (self.heldPage(path[k].pgno).getFreeBytes() >= MAX_SEP) return n;
+            n += 1;
+        }
+        return n + 1; // a new root
+    }
+
+    /// Holds the siblings that `rebalance` can use, from level `d` up.
+    /// Returns the maximum number of new pages that its redistributions need.
+    fn holdSiblings(self: *BPTree, path: []const PathEntry, d: usize) !usize {
+        var spares: usize = 0;
+        var k = d;
+        while (k > 0) : (k -= 1) {
+            const parent = self.heldPage(path[k - 1].pgno);
+            const idx = path[k - 1].idx;
+            const sib = if (idx > 0) idx - 1 else idx + 1;
+            self.hold(try self.poolGet(parent.getChild(sib)));
+            spares = @max(spares, self.splitPages(path, k - 1, parent.getFreeBytes() < MAX_SEP));
+            // A merge or a redistribution at level k removes at most one separator from the parent.
+            if (parent.getUsedBytes() >= MIN_FILL + MAX_SEP) break;
+        }
+        return spares;
+    }
+
+    /// Holds the path from the root to the leaf for `key` until `releaseHeld`.
     fn descend(self: *BPTree, key: []const u8, path: []PathEntry, depth: *usize) !Page {
+        errdefer self.releaseHeld();
         var pgno = self.root;
         var d: usize = 0;
         while (true) {
             const p = try self.poolGet(pgno);
+            self.hold(p);
             path[d].pgno = pgno;
             if (p.getType() == .leaf) {
                 depth.* = d;
@@ -248,7 +352,6 @@ pub const BPTree = struct {
             const i = p.childIndex(key);
             path[d].idx = i;
             pgno = p.getChild(i);
-            self.poolUnpin(p, false);
             d += 1;
             std.debug.assert(d < MAX_DEPTH);
         }
@@ -259,7 +362,7 @@ pub const BPTree = struct {
         var path: [MAX_DEPTH]PathEntry = undefined;
         var depth: usize = undefined;
         const leaf = try self.descend(key, &path, &depth);
-        defer self.poolUnpin(leaf, false);
+        defer self.releaseHeld();
         const r = leaf.search(key);
         if (r.found) {
             const val = leaf.getLeafVal(r.index);
@@ -270,10 +373,10 @@ pub const BPTree = struct {
         return null;
     }
 
-    /// true if split
-    fn insertUp(self: *BPTree, path: []const PathEntry, d: usize, idx: usize, c: []const u8) !bool {
+    /// true if split. The caller holds the path and reserves the new pages.
+    fn insertUp(self: *BPTree, path: []const PathEntry, d: usize, idx: usize, c: []const u8) bool {
         const pgno = path[d].pgno;
-        const p = try self.poolGet(pgno);
+        const p = self.poolGetPinned(pgno);
         if (p.insertCell(idx, c)) {
             self.poolUnpin(p, true);
             return false;
@@ -292,10 +395,7 @@ pub const BPTree = struct {
 
         const leaf = p.getType() == .leaf;
         const s = cl.chooseSplit(leaf);
-        const right = self.pageAlloc(p.getType()) catch |e| {
-            self.poolUnpin(p, false);
-            return e;
-        };
+        const right = self.takeSpare(p.getType());
         const right_pg = self.pgnoOf(right);
         var sep: [MAX_KEY + 6]u8 = undefined;
         var sep_sz: usize = undefined;
@@ -315,13 +415,13 @@ pub const BPTree = struct {
         self.poolUnpin(p, true);
 
         if (d == 0) {
-            const root = try self.pageAlloc(.internal);
+            const root = self.takeSpare(.internal);
             root.setLink(pgno);
             _ = root.insertCell(0, sep[0..sep_sz]);
             self.root = self.pgnoOf(root);
             self.poolUnpin(root, true);
         } else {
-            _ = try self.insertUp(path, d - 1, path[d - 1].idx, sep[0..sep_sz]);
+            _ = self.insertUp(path, d - 1, path[d - 1].idx, sep[0..sep_sz]);
         }
         return true;
     }
@@ -332,19 +432,34 @@ pub const BPTree = struct {
         var path: [MAX_DEPTH]PathEntry = undefined;
         var depth: usize = undefined;
         const leaf = try self.descend(key, &path, &depth);
-        const r = leaf.search(key);
-        if (r.found) leaf.deleteCell(r.index);
-        self.poolUnpin(leaf, r.found);
+        defer self.releaseHeld();
+        defer self.releaseSpares();
 
+        const r = leaf.search(key);
+        const old_sz = if (r.found) leaf.getCell(r.index).len + 2 else 0;
+        const new_sz = 4 + key.len + val.len + 2;
+        const splits = leaf.getFreeBytes() + old_sz < new_sz;
+        var spares = self.splitPages(&path, depth, splits);
+        if (r.found and !splits and leaf.getUsedBytes() - old_sz + new_sz < MIN_FILL)
+            spares = @max(spares, try self.holdSiblings(&path, depth));
+        try self.reserve(spares);
+
+        // Nothing below can fail, so the tree changes completely or not at all.
+        if (r.found) {
+            leaf.deleteCell(r.index);
+            self.markDirty(leaf);
+        }
         var c: [4 + MAX_KEY + MAX_VAL]u8 = undefined;
         const sz = makeLeafCell(&c, key, val);
-        const split = try self.insertUp(&path, depth, r.index, c[0..sz]);
+        const split = self.insertUp(&path, depth, r.index, c[0..sz]);
+        std.debug.assert(split == splits);
         if (r.found and !split)
-            try self.rebalance(&path, depth);
+            self.rebalance(&path, depth);
     }
 
-    fn rebalance(self: *BPTree, path: []const PathEntry, d: usize) !void {
-        const p = try self.poolGet(path[d].pgno);
+    /// The caller holds the path and the siblings, and reserves the new pages.
+    fn rebalance(self: *BPTree, path: []const PathEntry, d: usize) void {
+        const p = self.poolGetPinned(path[d].pgno);
 
         if (d == 0) {
             if (p.getType() == .internal and p.getN() == 0) {
@@ -362,12 +477,12 @@ pub const BPTree = struct {
         }
         self.poolUnpin(p, false);
 
-        const parent = try self.poolGet(path[d - 1].pgno);
+        const parent = self.poolGetPinned(path[d - 1].pgno);
         const idx = path[d - 1].idx;
         const li = if (idx > 0) idx - 1 else idx;
         const sep_idx = li;
-        const left = try self.poolGet(parent.getChild(li));
-        const right = try self.poolGet(parent.getChild(li + 1));
+        const left = self.poolGetPinned(parent.getChild(li));
+        const right = self.poolGetPinned(parent.getChild(li + 1));
         const leaf = left.getType() == .leaf;
 
         const S = struct {
@@ -392,7 +507,7 @@ pub const BPTree = struct {
             self.poolUnpin(left, true);
             parent.deleteCell(sep_idx);
             self.poolUnpin(parent, true);
-            try self.rebalance(path, d - 1);
+            self.rebalance(path, d - 1);
             return;
         }
 
@@ -417,8 +532,8 @@ pub const BPTree = struct {
         parent.deleteCell(sep_idx);
         self.poolUnpin(parent, true);
 
-        if (!try self.insertUp(path, d - 1, sep_idx, sep[0..sep_sz])) {
-            try self.rebalance(path, d - 1);
+        if (!self.insertUp(path, d - 1, sep_idx, sep[0..sep_sz])) {
+            self.rebalance(path, d - 1);
         }
     }
 
@@ -427,11 +542,20 @@ pub const BPTree = struct {
         var path: [MAX_DEPTH]PathEntry = undefined;
         var depth: usize = undefined;
         const leaf = try self.descend(key, &path, &depth);
+        defer self.releaseHeld();
+        defer self.releaseSpares();
+
         const r = leaf.search(key);
-        if (r.found) leaf.deleteCell(r.index);
-        self.poolUnpin(leaf, r.found);
-        if (r.found) try self.rebalance(&path, depth);
-        return r.found;
+        if (!r.found) return false;
+        const old_sz = leaf.getCell(r.index).len + 2;
+        if (leaf.getUsedBytes() - old_sz < MIN_FILL)
+            try self.reserve(try self.holdSiblings(&path, depth));
+
+        // Nothing below can fail, so the tree changes completely or not at all.
+        leaf.deleteCell(r.index);
+        self.markDirty(leaf);
+        self.rebalance(&path, depth);
+        return true;
     }
 };
 
@@ -864,13 +988,14 @@ test "BPTree get" {
 
     var p: [MAX_DEPTH]PathEntry = undefined;
     var depth: usize = undefined;
-    const leaf = try t.descend("z", &p, &depth);
-    defer t.poolUnpin(leaf, false);
+    _ = try t.descend("z", &p, &depth);
+    defer t.releaseHeld();
     try std.testing.expectEqual(1, depth);
     try std.testing.expectEqual(t.root, p[0].pgno);
     try std.testing.expectEqual(1, p[0].idx);
     try std.testing.expectEqual(t.pgnoOf(right), p[1].pgno);
-    try std.testing.expectEqual(1, t.poolPinned());
+    // descend holds the root and the leaf.
+    try std.testing.expectEqual(2, t.poolPinned());
 }
 
 test CellList {
@@ -979,6 +1104,120 @@ test "BPTree put get delete" {
     }
     try std.testing.expectEqual(0, t.poolPinned());
 
+    const root = try t.poolGet(t.root);
+    defer t.poolUnpin(root, false);
+    try std.testing.expectEqual(.leaf, root.getType());
+    try std.testing.expectEqual(0, root.getN());
+}
+
+test "BPTree failed operation does not change the tree" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const name = "fail.bin";
+    const file = try tmp.dir.createFile(io, name, .{});
+    defer file.close(io);
+    const path = try tmp.dir.realPathFileAlloc(io, name, gpa);
+    defer gpa.free(path);
+
+    var t: BPTree = try .init(gpa, io, path);
+    defer t.deinit(gpa);
+
+    var kbuf: [16]u8 = undefined;
+    var out: [MAX_VAL]u8 = undefined;
+    const big: [MAX_VAL]u8 = @splat('v');
+
+    var n: usize = 0;
+    while (t.npages < 2 * POOL_FRAMES + 2 * MAX_DEPTH) : (n += 1) {
+        try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{n}), &big);
+    }
+
+    // Pin pages that are not on the path of `key` and are not siblings of it,
+    // so that only the path fits in the pool.
+    const Pinner = struct {
+        fn pinAllBut(tree: *BPTree, key: []const u8, pinned: *[POOL_FRAMES]Page) !usize {
+            var p: [MAX_DEPTH]PathEntry = undefined;
+            var depth: usize = undefined;
+            _ = try tree.descend(key, &p, &depth);
+            defer tree.releaseHeld();
+            var skip: [2 * MAX_DEPTH]u32 = undefined;
+            var nskip: usize = 0;
+            for (p[0 .. depth + 1], 0..) |e, k| {
+                skip[nskip] = e.pgno;
+                nskip += 1;
+                if (k == 0) continue;
+                const parent = tree.heldPage(p[k - 1].pgno);
+                const idx = p[k - 1].idx;
+                skip[nskip] = parent.getChild(if (idx > 0) idx - 1 else idx + 1);
+                nskip += 1;
+            }
+            var count: usize = 0;
+            var pg: u32 = 1;
+            while (count < POOL_FRAMES - (depth + 1)) : (pg += 1) {
+                if (std.mem.indexOfScalar(u32, skip[0..nskip], pg) != null) continue;
+                pinned[count] = try tree.poolGet(pg);
+                count += 1;
+            }
+            return count;
+        }
+        fn unpinAll(tree: *BPTree, pinned: []const Page) void {
+            for (pinned) |p| tree.poolUnpin(p, false);
+        }
+    };
+    var pinned: [POOL_FRAMES]Page = undefined;
+
+    // A put that must split fails before it changes the tree.
+    var failed_puts: usize = 0;
+    for (0..n) |i| {
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}x", .{i});
+        const count = try Pinner.pinAllBut(&t, k, &pinned);
+        const npages = t.npages;
+        const freelist = t.freelist;
+        const root = t.root;
+        const result = t.put(k, &big);
+        try std.testing.expectEqual(@as(i32, @intCast(count)), t.poolPinned());
+        Pinner.unpinAll(&t, pinned[0..count]);
+        if (result) |_| continue else |err| try std.testing.expectEqual(error.PoolExhausted, err);
+        failed_puts += 1;
+        try std.testing.expectEqual(null, try t.get(k, &out));
+        try std.testing.expectEqual(npages, t.npages);
+        try std.testing.expectEqual(freelist, t.freelist);
+        try std.testing.expectEqual(root, t.root);
+        // The same put works when the pool has space.
+        try t.put(k, &big);
+        try std.testing.expectEqualStrings(&big, (try t.get(k, &out)).?);
+    }
+    try std.testing.expect(failed_puts > 0);
+
+    // A delete that must rebalance fails before it changes the tree.
+    var failed_deletes: usize = 0;
+    for (0..2 * n) |j| {
+        const k = if (j % 2 == 0)
+            try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{j / 2})
+        else
+            try std.fmt.bufPrint(&kbuf, "key{d:0>8}x", .{j / 2});
+        const count = try Pinner.pinAllBut(&t, k, &pinned);
+        const result = t.delete(k);
+        try std.testing.expectEqual(@as(i32, @intCast(count)), t.poolPinned());
+        Pinner.unpinAll(&t, pinned[0..count]);
+        if (result) |found| {
+            try std.testing.expect(found);
+            continue;
+        } else |err| try std.testing.expectEqual(error.PoolExhausted, err);
+        failed_deletes += 1;
+        try std.testing.expectEqualStrings(&big, (try t.get(k, &out)).?);
+        try std.testing.expect(try t.delete(k));
+    }
+    try std.testing.expect(failed_deletes > 0);
+
+    for (0..n) |i| {
+        try std.testing.expectEqual(null, try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out));
+        try std.testing.expectEqual(null, try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}x", .{i}), &out));
+    }
+    try std.testing.expectEqual(0, t.poolPinned());
     const root = try t.poolGet(t.root);
     defer t.poolUnpin(root, false);
     try std.testing.expectEqual(.leaf, root.getType());
