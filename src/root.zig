@@ -301,11 +301,11 @@ pub const BPTree = struct {
     fn pageAlloc(self: *BPTree, t: Page.Type) !Page {
         if (self.freelist != 0) {
             const p = try self.getPage(self.freelist);
-            if (p.getType() != .free) {
+            if (p.kind() != .free) {
                 self.pool.unpin(p, .clean);
                 return error.BadFile;
             }
-            self.freelist = p.getLink();
+            self.freelist = p.link();
             p.init(t);
             return p;
         }
@@ -352,7 +352,7 @@ pub const BPTree = struct {
         var k = d;
         while (k > 0) {
             k -= 1;
-            if (self.pool.heldPage(path[k].pgno).getFreeBytes() >= max_sep) return n;
+            if (self.pool.heldPage(path[k].pgno).freeBytes() >= max_sep) return n;
             n += 1;
         }
         return n + 1; // a new root
@@ -366,12 +366,12 @@ pub const BPTree = struct {
         while (k > 0) : (k -= 1) {
             const parent = self.pool.heldPage(path[k - 1].pgno);
             const idx = path[k - 1].idx;
-            const sib = try self.getPage(parent.getChild(if (idx > 0) idx - 1 else idx + 1));
+            const sib = try self.getPage(parent.child(if (idx > 0) idx - 1 else idx + 1));
             self.held.push(sib);
-            if (sib.getType() != self.pool.heldPage(path[k].pgno).getType()) return error.BadFile;
-            spares = @max(spares, self.splitPages(path, k - 1, parent.getFreeBytes() < max_sep));
+            if (sib.kind() != self.pool.heldPage(path[k].pgno).kind()) return error.BadFile;
+            spares = @max(spares, self.splitPages(path, k - 1, parent.freeBytes() < max_sep));
             // A merge or a redistribution at level k removes at most one separator from the parent.
-            if (parent.getUsedBytes() >= min_fill + max_sep) break;
+            if (parent.usedBytes() >= min_fill + max_sep) break;
         }
         return spares;
     }
@@ -386,7 +386,7 @@ pub const BPTree = struct {
             self.held.push(p);
             const e = &path.entries[path.depth];
             e.pgno = pgno;
-            switch (p.getType()) {
+            switch (p.kind()) {
                 .leaf => {
                     path.leaf = p;
                     return path;
@@ -395,7 +395,7 @@ pub const BPTree = struct {
                 else => return error.BadFile,
             }
             e.idx = p.childIndex(key);
-            pgno = p.getChild(e.idx);
+            pgno = p.child(e.idx);
             path.depth += 1;
             if (path.depth >= max_depth) return error.BadFile;
         }
@@ -408,7 +408,7 @@ pub const BPTree = struct {
         const leaf = path.leaf;
         const r = leaf.search(key);
         if (r.found) {
-            const val = leaf.getLeafVal(r.index);
+            const val = leaf.leafVal(r.index);
             if (out.len < val.len) return error.NoSpaceLeft;
             @memcpy(out[0..val.len], val);
             return out[0..val.len];
@@ -427,25 +427,25 @@ pub const BPTree = struct {
 
         const cl = self.scratch;
         cl.reset();
-        for (0..p.getN()) |i| {
+        for (0..p.count()) |i| {
             if (i == idx) cl.add(c);
-            cl.add(p.getCell(i));
+            cl.add(p.cell(i));
         }
-        if (idx == p.getN()) cl.add(c);
+        if (idx == p.count()) cl.add(c);
 
-        const leaf = p.getType() == .leaf;
+        const leaf = p.kind() == .leaf;
         const s = cl.chooseSplit(leaf);
-        const right = self.takeSpare(p.getType());
+        const right = self.takeSpare(p.kind());
         const right_pg = self.pool.pgnoOf(right);
         var sep_buf: [max_key + 6]u8 = undefined;
         const sep = if (leaf) blk: {
-            right.fill(.leaf, p.getLink(), cl, s, cl.cells.len);
+            right.fill(.leaf, p.link(), cl, s, cl.cells.len);
             p.fill(.leaf, right_pg, cl, 0, s);
-            break :blk makeInternalCell(&sep_buf, right_pg, right.getCellKey(0));
+            break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
         } else blk: {
             const mid = cl.cells.items()[s];
             right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
-            p.fill(.internal, p.getLink(), cl, 0, s);
+            p.fill(.internal, p.link(), cl, 0, s);
             break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
         };
         self.pool.unpin(right, .dirty);
@@ -472,11 +472,11 @@ pub const BPTree = struct {
         defer self.releaseSpares();
 
         const r = leaf.search(key);
-        const old_sz = if (r.found) leaf.getCell(r.index).len + 2 else 0;
+        const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
         const new_sz = 4 + key.len + val.len + 2;
-        const splits = leaf.getFreeBytes() + old_sz < new_sz;
+        const splits = leaf.freeBytes() + old_sz < new_sz;
         var spares = self.splitPages(path.slice(), path.depth, splits);
-        if (r.found and !splits and leaf.getUsedBytes() - old_sz + new_sz < min_fill)
+        if (r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill)
             spares = @max(spares, try self.holdSiblings(path.slice(), path.depth));
         try self.reserve(spares);
 
@@ -497,8 +497,8 @@ pub const BPTree = struct {
         const p = self.pool.pinHeld(path[d].pgno);
 
         if (d == 0) {
-            if (p.getType() == .internal and p.getN() == 0) {
-                self.root = p.getLink();
+            if (p.kind() == .internal and p.count() == 0) {
+                self.root = p.link();
                 self.pageFree(p);
             } else {
                 self.pool.unpin(p, .clean);
@@ -506,7 +506,7 @@ pub const BPTree = struct {
             return;
         }
 
-        if (p.getUsedBytes() >= min_fill) {
+        if (p.usedBytes() >= min_fill) {
             self.pool.unpin(p, .clean);
             return;
         }
@@ -516,24 +516,24 @@ pub const BPTree = struct {
         const idx = path[d - 1].idx;
         const li = if (idx > 0) idx - 1 else idx;
         const sep_idx = li;
-        const left = self.pool.pinHeld(parent.getChild(li));
-        const right = self.pool.pinHeld(parent.getChild(li + 1));
-        const leaf = left.getType() == .leaf;
+        const left = self.pool.pinHeld(parent.child(li));
+        const right = self.pool.pinHeld(parent.child(li + 1));
+        const leaf = left.kind() == .leaf;
 
         const cl = self.scratch;
         cl.reset();
         cl.addPage(left);
         if (!leaf) {
-            const k = parent.getCellKey(sep_idx);
+            const k = parent.cellKey(sep_idx);
             var c: [max_key + 6]u8 = undefined;
-            cl.add(makeInternalCell(&c, right.getLink(), k));
+            cl.add(makeInternalCell(&c, right.link(), k));
         }
         cl.addPage(right);
 
         // merge into left
         if (cl.bytes(0, cl.cells.len) <= capacity) {
-            const link = if (leaf) right.getLink() else left.getLink();
-            left.fill(left.getType(), link, cl, 0, cl.cells.len);
+            const link = if (leaf) right.link() else left.link();
+            left.fill(left.kind(), link, cl, 0, cl.cells.len);
             self.pageFree(right);
             self.pool.unpin(left, .dirty);
             parent.deleteCell(sep_idx);
@@ -548,11 +548,11 @@ pub const BPTree = struct {
         const right_pg = self.pool.pgnoOf(right);
         const sep = if (leaf) blk: {
             left.fill(.leaf, right_pg, cl, 0, s);
-            right.fill(.leaf, right.getLink(), cl, s, cl.cells.len);
-            break :blk makeInternalCell(&sep_buf, right_pg, right.getCellKey(0));
+            right.fill(.leaf, right.link(), cl, s, cl.cells.len);
+            break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
         } else blk: {
             const mid = cl.cells.items()[s];
-            left.fill(.internal, left.getLink(), cl, 0, s);
+            left.fill(.internal, left.link(), cl, 0, s);
             right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
             break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
         };
@@ -575,8 +575,8 @@ pub const BPTree = struct {
 
         const r = leaf.search(key);
         if (!r.found) return false;
-        const old_sz = leaf.getCell(r.index).len + 2;
-        if (leaf.getUsedBytes() - old_sz < min_fill)
+        const old_sz = leaf.cell(r.index).len + 2;
+        if (leaf.usedBytes() - old_sz < min_fill)
             try self.reserve(try self.holdSiblings(path.slice(), path.depth));
 
         // Nothing below can fail, so the tree changes completely or not at all.
@@ -604,20 +604,20 @@ const Page = struct {
         self.setCellStart(page_size);
     }
 
-    fn getType(self: Page) Type {
+    fn kind(self: Page) Type {
         return @fromBackingInt(self.page[0]);
     }
 
-    fn getN(self: Page) u16 {
+    fn count(self: Page) u16 {
         return get16(self.page[2..]);
     }
-    fn getCellStart(self: Page) u16 {
+    fn cellStart(self: Page) u16 {
         return get16(self.page[4..]);
     }
-    fn getFrag(self: Page) u16 {
+    fn frag(self: Page) u16 {
         return get16(self.page[6..]);
     }
-    fn getLink(self: Page) u32 {
+    fn link(self: Page) u32 {
         return get32(self.page[8..12]);
     }
 
@@ -634,23 +634,23 @@ const Page = struct {
         put32(self.page[8..], v);
     }
 
-    fn getSlot(self: Page, i: usize) u16 {
+    fn slot(self: Page, i: usize) u16 {
         return get16(self.page[hdr_size + 2 * i ..]);
     }
     fn setSlot(self: Page, i: usize, off: usize) void {
         put16(self.page[hdr_size + 2 * i ..], @intCast(off));
     }
-    fn getCellSize(self: Page, c: []const u8) usize {
-        if (self.getType() == .leaf) return 4 + @as(usize, get16(c)) + get16(c[2..]);
+    fn cellSize(self: Page, c: []const u8) usize {
+        if (self.kind() == .leaf) return 4 + @as(usize, get16(c)) + get16(c[2..]);
         return 6 + @as(usize, get16(c[4..]));
     }
-    fn getCell(self: Page, i: usize) []const u8 {
-        const c = self.page[self.getSlot(i)..];
-        return c[0..self.getCellSize(c)];
+    fn cell(self: Page, i: usize) []const u8 {
+        const c = self.page[self.slot(i)..];
+        return c[0..self.cellSize(c)];
     }
-    fn getCellKey(self: Page, i: usize) []const u8 {
-        const c = self.getCell(i);
-        if (self.getType() == .leaf) {
+    fn cellKey(self: Page, i: usize) []const u8 {
+        const c = self.cell(i);
+        if (self.kind() == .leaf) {
             const klen = get16(c);
             return c[4..][0..klen];
         } else {
@@ -658,22 +658,22 @@ const Page = struct {
             return c[6..][0..klen];
         }
     }
-    fn getLeafVal(self: Page, i: usize) []const u8 {
-        const c = self.getCell(i);
+    fn leafVal(self: Page, i: usize) []const u8 {
+        const c = self.cell(i);
         const vlen = get16(c[2..4]);
         return c[4 + get16(c) ..][0..vlen];
     }
 
-    fn getChild(self: Page, i: usize) u32 {
-        return if (i == 0) self.getLink() else get32(self.getCell(i - 1));
+    fn child(self: Page, i: usize) u32 {
+        return if (i == 0) self.link() else get32(self.cell(i - 1));
     }
 
-    fn getUsedBytes(self: Page) usize {
-        return capacity - (self.getCellStart() - hdr_size - 2 * @as(usize, self.getN())) - self.getFrag();
+    fn usedBytes(self: Page) usize {
+        return capacity - (self.cellStart() - hdr_size - 2 * @as(usize, self.count())) - self.frag();
     }
 
-    fn getFreeBytes(self: Page) usize {
-        return capacity - self.getUsedBytes();
+    fn freeBytes(self: Page) usize {
+        return capacity - self.usedBytes();
     }
 
     const SearchResult = struct {
@@ -681,18 +681,18 @@ const Page = struct {
         index: usize,
     };
     fn search(self: Page, key: []const u8) SearchResult {
-        const n = self.getN();
+        const n = self.count();
         var lo: usize = 0;
         var hi: usize = n;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.lessThan(u8, self.getCellKey(mid), key)) {
+            if (std.mem.lessThan(u8, self.cellKey(mid), key)) {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        const found = lo < n and std.mem.eql(u8, key, self.getCellKey(lo));
+        const found = lo < n and std.mem.eql(u8, key, self.cellKey(lo));
         return .{ .found = found, .index = lo };
     }
 
@@ -701,9 +701,9 @@ const Page = struct {
         const tmp_page: Page = .{ .page = &tmp };
         @memcpy(&tmp, self.page);
         var top: usize = page_size;
-        const n = self.getN();
+        const n = self.count();
         for (0..n) |i| {
-            const c = tmp_page.getCell(i);
+            const c = tmp_page.cell(i);
             top -= c.len;
             @memcpy(self.page[top..][0..c.len], c);
             self.setSlot(i, top);
@@ -713,11 +713,11 @@ const Page = struct {
     }
 
     fn insertCell(self: Page, idx: usize, c: []const u8) bool {
-        if (self.getFreeBytes() < c.len + 2) return false;
-        const n: usize = self.getN();
-        if (self.getCellStart() - (hdr_size + 2 * n) < c.len + 2)
+        if (self.freeBytes() < c.len + 2) return false;
+        const n: usize = self.count();
+        if (self.cellStart() - (hdr_size + 2 * n) < c.len + 2)
             self.compact();
-        const off: usize = self.getCellStart() - c.len;
+        const off: usize = self.cellStart() - c.len;
         @memcpy(self.page[off..][0..c.len], c);
         self.setCellStart(off);
 
@@ -729,13 +729,13 @@ const Page = struct {
     }
 
     fn deleteCell(self: Page, idx: usize) void {
-        const n: usize = self.getN();
-        const off = self.getSlot(idx);
-        const sz = self.getCell(idx).len;
-        if (off == self.getCellStart()) {
+        const n: usize = self.count();
+        const off = self.slot(idx);
+        const sz = self.cell(idx).len;
+        if (off == self.cellStart()) {
             self.setCellStart(off + sz);
         } else {
-            self.setFrag(self.getFrag() + sz);
+            self.setFrag(self.frag() + sz);
         }
         const s = 2 * (n - idx - 1);
         @memmove(self.page[hdr_size + 2 * idx ..][0..s], self.page[hdr_size + 2 * (idx + 1) ..][0..s]);
@@ -747,9 +747,9 @@ const Page = struct {
         return if (e.found) e.index + 1 else e.index;
     }
 
-    fn fill(self: Page, t: Type, link: u32, cl: *const CellList, from: usize, to: usize) void {
+    fn fill(self: Page, t: Type, link_pgno: u32, cl: *const CellList, from: usize, to: usize) void {
         self.init(t);
-        self.setLink(link);
+        self.setLink(link_pgno);
         for (cl.cells.items()[from..to], 0..) |c, i| {
             const ok = self.insertCell(i, c);
             std.debug.assert(ok);
@@ -790,7 +790,7 @@ const CellList = struct {
     }
 
     fn addPage(self: *CellList, p: Page) void {
-        for (0..p.getN()) |i| self.add(p.getCell(i));
+        for (0..p.count()) |i| self.add(p.cell(i));
     }
 
     fn bytes(self: *const CellList, from: usize, to: usize) usize {
@@ -878,8 +878,8 @@ test Page {
 
     const leaf: Page = .{ .page = &buf };
     leaf.init(.leaf);
-    try std.testing.expectEqual(.leaf, leaf.getType());
-    try std.testing.expectEqual(capacity, leaf.getFreeBytes());
+    try std.testing.expectEqual(.leaf, leaf.kind());
+    try std.testing.expectEqual(capacity, leaf.freeBytes());
 
     const keys = [_][]const u8{ "delta", "alpha", "charlie", "bravo" };
     for (keys) |k| {
@@ -888,24 +888,24 @@ test Page {
         try std.testing.expect(!r.found);
         try std.testing.expect(leaf.insertCell(r.index, c));
     }
-    try std.testing.expectEqual(4, leaf.getN());
-    try std.testing.expectEqualStrings("alpha", leaf.getCellKey(0));
-    try std.testing.expectEqualStrings("delta", leaf.getCellKey(3));
-    try std.testing.expectEqualStrings("value", leaf.getLeafVal(2));
+    try std.testing.expectEqual(4, leaf.count());
+    try std.testing.expectEqualStrings("alpha", leaf.cellKey(0));
+    try std.testing.expectEqualStrings("delta", leaf.cellKey(3));
+    try std.testing.expectEqualStrings("value", leaf.leafVal(2));
 
     const r = leaf.search("alpha");
     try std.testing.expect(r.found);
     leaf.deleteCell(r.index);
-    try std.testing.expectEqual(3, leaf.getN());
-    try std.testing.expect(leaf.getFrag() > 0);
+    try std.testing.expectEqual(3, leaf.count());
+    try std.testing.expect(leaf.frag() > 0);
 
-    const used = leaf.getUsedBytes();
+    const used = leaf.usedBytes();
     leaf.compact();
-    try std.testing.expectEqual(0, leaf.getFrag());
-    try std.testing.expectEqual(used, leaf.getUsedBytes());
-    try std.testing.expectEqualStrings("bravo", leaf.getCellKey(0));
-    try std.testing.expectEqualStrings("charlie", leaf.getCellKey(1));
-    try std.testing.expectEqualStrings("delta", leaf.getCellKey(2));
+    try std.testing.expectEqual(0, leaf.frag());
+    try std.testing.expectEqual(used, leaf.usedBytes());
+    try std.testing.expectEqualStrings("bravo", leaf.cellKey(0));
+    try std.testing.expectEqualStrings("charlie", leaf.cellKey(1));
+    try std.testing.expectEqualStrings("delta", leaf.cellKey(2));
 
     // Fill the page; insertCell must compact the fragmented space before it gives up.
     var i: usize = 0;
@@ -914,15 +914,15 @@ test Page {
         const k = std.fmt.bufPrint(&kbuf, "k{d:0>6}", .{i}) catch unreachable;
         if (!leaf.insertCell(leaf.search(k).index, makeLeafCell(&cell, k, "v"))) break;
     }
-    try std.testing.expect(leaf.getFreeBytes() < 4 + 7 + 1 + 2);
+    try std.testing.expect(leaf.freeBytes() < 4 + 7 + 1 + 2);
 
     const internal: Page = .{ .page = &buf };
     internal.init(.internal);
     internal.setLink(7);
     try std.testing.expect(internal.insertCell(0, makeInternalCell(&cell, 9, "mid")));
-    try std.testing.expectEqual(7, internal.getChild(0));
-    try std.testing.expectEqual(9, internal.getChild(1));
-    try std.testing.expectEqualStrings("mid", internal.getCellKey(0));
+    try std.testing.expectEqual(7, internal.child(0));
+    try std.testing.expectEqual(9, internal.child(1));
+    try std.testing.expectEqualStrings("mid", internal.cellKey(0));
 }
 
 test Pool {
@@ -943,7 +943,7 @@ test Pool {
     try std.testing.expectEqual(0, t.pool.pinned());
 
     const p = try t.getPage(1);
-    try std.testing.expectEqual(.leaf, p.getType());
+    try std.testing.expectEqual(.leaf, p.kind());
     t.pool.unpin(p, .clean);
     try std.testing.expectEqual(0, t.pool.pinned());
     try t.pool.flush();
@@ -964,7 +964,7 @@ test "BPTree page alloc" {
     const a = try t.pageAlloc(.leaf);
     const a_pgno = t.pool.pgnoOf(a);
     try std.testing.expectEqual(2, a_pgno);
-    try std.testing.expectEqual(.leaf, a.getType());
+    try std.testing.expectEqual(.leaf, a.kind());
     try std.testing.expectEqual(3, t.npages);
 
     t.pageFree(a);
@@ -972,7 +972,7 @@ test "BPTree page alloc" {
 
     const b = try t.pageAlloc(.internal);
     try std.testing.expectEqual(a_pgno, t.pool.pgnoOf(b));
-    try std.testing.expectEqual(.internal, b.getType());
+    try std.testing.expectEqual(.internal, b.kind());
     try std.testing.expectEqual(0, t.freelist);
     try std.testing.expectEqual(3, t.npages);
     t.pool.unpin(b, .dirty);
@@ -1048,9 +1048,9 @@ test CellList {
     const split = cl.chooseSplit(true);
     try std.testing.expectEqual(2, split);
     p.fill(.leaf, 0, &cl, 0, split);
-    try std.testing.expectEqual(2, p.getN());
-    try std.testing.expectEqualStrings("a", p.getCellKey(0));
-    try std.testing.expectEqualStrings("b", p.getCellKey(1));
+    try std.testing.expectEqual(2, p.count());
+    try std.testing.expectEqualStrings("a", p.cellKey(0));
+    try std.testing.expectEqualStrings("b", p.cellKey(1));
 
     // An internal split moves the middle cell up, so it is in neither half.
     cl.reset();
@@ -1125,8 +1125,8 @@ test "BPTree put get delete" {
 
     const root = try t.getPage(t.root);
     defer t.pool.unpin(root, .clean);
-    try std.testing.expectEqual(.leaf, root.getType());
-    try std.testing.expectEqual(0, root.getN());
+    try std.testing.expectEqual(.leaf, root.kind());
+    try std.testing.expectEqual(0, root.count());
 }
 
 test "BPTree failed operation does not change the tree" {
@@ -1159,7 +1159,7 @@ test "BPTree failed operation does not change the tree" {
                 if (k == 0) continue;
                 const parent = tree.pool.heldPage(p[k - 1].pgno);
                 const idx = p[k - 1].idx;
-                skip.push(parent.getChild(if (idx > 0) idx - 1 else idx + 1));
+                skip.push(parent.child(if (idx > 0) idx - 1 else idx + 1));
             }
             var count: usize = 0;
             var pg: u32 = 1;
@@ -1227,6 +1227,6 @@ test "BPTree failed operation does not change the tree" {
     try std.testing.expectEqual(0, t.pool.pinned());
     const root = try t.getPage(t.root);
     defer t.pool.unpin(root, .clean);
-    try std.testing.expectEqual(.leaf, root.getType());
-    try std.testing.expectEqual(0, root.getN());
+    try std.testing.expectEqual(.leaf, root.kind());
+    try std.testing.expectEqual(0, root.count());
 }
