@@ -13,7 +13,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
-    const t: *bplustree_zig.BPTree = try .init(gpa, init.io, args[1]);
+    var t: bplustree_zig.BPTree = try .init(gpa, init.io, args[1]);
     defer t.deinit(gpa);
 
     return 0;

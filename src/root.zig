@@ -21,7 +21,7 @@ comptime {
 pub const META_PGNO = 0;
 pub const MAGIC = "BPTDISK1";
 
-pub const Error = error{ BadFile, KeyTooLarge };
+pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge };
 
 fn get16(p: []const u8) u16 {
     return std.mem.readInt(u16, p[0..2], .little);
@@ -87,8 +87,8 @@ pub const BPTree = struct {
 
     pub fn deinit(self: *BPTree, gpa: Allocator) void {
         std.debug.assert(self.poolPinned() == 0);
-        self.poolFlush() catch {};
-        self.metaWrite() catch {};
+        self.poolFlush() catch |err| std.debug.panic("poolFlush: {t}", .{err});
+        self.metaWrite() catch |err| std.debug.panic("metaWrite: {t}", .{err});
         self.file.sync(self.io) catch |err| std.debug.panic("fsync: {t}", .{err});
         self.file.close(self.io);
         gpa.free(self.mem);
@@ -270,6 +270,7 @@ pub const BPTree = struct {
         return null;
     }
 
+    /// true if split
     fn insertUp(self: *BPTree, path: []const PathEntry, d: usize, idx: usize, c: []const u8) !bool {
         const pgno = path[d].pgno;
         const p = try self.poolGet(pgno);
@@ -320,10 +321,117 @@ pub const BPTree = struct {
             self.root = self.pgnoOf(root);
             self.poolUnpin(root, true);
         } else {
-            const ok = try self.insertUp(path, d - 1, path[d - 1].idx, sep[0..sep_sz]);
-            std.debug.assert(ok);
+            _ = try self.insertUp(path, d - 1, path[d - 1].idx, sep[0..sep_sz]);
         }
         return true;
+    }
+
+    pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
+        if (key.len > MAX_KEY) return error.KeyTooLarge;
+        if (val.len > MAX_VAL) return error.ValueTooLarge;
+        var path: [MAX_DEPTH]PathEntry = undefined;
+        var depth: usize = undefined;
+        const leaf = try self.descend(key, &path, &depth);
+        const r = leaf.search(key);
+        if (r.found) leaf.deleteCell(r.index);
+        self.poolUnpin(leaf, r.found);
+
+        var c: [4 + MAX_KEY + MAX_VAL]u8 = undefined;
+        const sz = makeLeafCell(&c, key, val);
+        const split = try self.insertUp(&path, depth, r.index, c[0..sz]);
+        if (r.found and !split)
+            try self.rebalance(&path, depth);
+    }
+
+    fn rebalance(self: *BPTree, path: []const PathEntry, d: usize) !void {
+        const p = try self.poolGet(path[d].pgno);
+
+        if (d == 0) {
+            if (p.getType() == .internal and p.getN() == 0) {
+                self.root = p.getLink();
+                self.pageFree(p);
+            } else {
+                self.poolUnpin(p, false);
+            }
+            return;
+        }
+
+        if (p.getUsedBytes() >= MIN_FILL) {
+            self.poolUnpin(p, false);
+            return;
+        }
+        self.poolUnpin(p, false);
+
+        const parent = try self.poolGet(path[d - 1].pgno);
+        const idx = path[d - 1].idx;
+        const li = if (idx > 0) idx - 1 else idx;
+        const sep_idx = li;
+        const left = try self.poolGet(parent.getChild(li));
+        const right = try self.poolGet(parent.getChild(li + 1));
+        const leaf = left.getType() == .leaf;
+
+        const S = struct {
+            var cl: CellList = undefined;
+        };
+        var cl = &S.cl;
+        cl.reset();
+        cl.addPage(left);
+        if (!leaf) {
+            const k = parent.getCellKey(sep_idx);
+            var c: [MAX_KEY + 6]u8 = undefined;
+            const sz = makeInternalCell(&c, right.getLink(), k);
+            cl.add(c[0..sz]);
+        }
+        cl.addPage(right);
+
+        // merge into left
+        if (cl.bytes(0, cl.n) <= CAPACITY) {
+            const link = if (leaf) right.getLink() else left.getLink();
+            left.fill(left.getType(), link, cl, 0, cl.n);
+            self.pageFree(right);
+            self.poolUnpin(left, true);
+            parent.deleteCell(sep_idx);
+            self.poolUnpin(parent, true);
+            try self.rebalance(path, d - 1);
+            return;
+        }
+
+        // split evenly
+        const s = cl.chooseSplit(leaf);
+        var sep: [MAX_KEY + 6]u8 = undefined;
+        var sep_sz: usize = undefined;
+        const right_pg = self.pgnoOf(right);
+        if (leaf) {
+            left.fill(.leaf, right_pg, cl, 0, s);
+            right.fill(.leaf, right.getLink(), cl, s, cl.n);
+            const k = right.getCellKey(0);
+            sep_sz = makeInternalCell(&sep, right_pg, k);
+        } else {
+            const mid = cl.cell[s];
+            left.fill(.internal, left.getLink(), cl, 0, s);
+            right.fill(.internal, get32(mid), cl, s + 1, cl.n);
+            sep_sz = makeInternalCell(&sep, right_pg, mid[6..][0..get16(mid[4..])]);
+        }
+        self.poolUnpin(left, true);
+        self.poolUnpin(right, true);
+        parent.deleteCell(sep_idx);
+        self.poolUnpin(parent, true);
+
+        if (!try self.insertUp(path, d - 1, sep_idx, sep[0..sep_sz])) {
+            try self.rebalance(path, d - 1);
+        }
+    }
+
+    pub fn delete(self: *BPTree, key: []const u8) !bool {
+        if (key.len > MAX_KEY) return error.KeyTooLarge;
+        var path: [MAX_DEPTH]PathEntry = undefined;
+        var depth: usize = undefined;
+        const leaf = try self.descend(key, &path, &depth);
+        const r = leaf.search(key);
+        if (r.found) leaf.deleteCell(r.index);
+        self.poolUnpin(leaf, r.found);
+        if (r.found) try self.rebalance(&path, depth);
+        return r.found;
     }
 };
 
@@ -803,4 +911,76 @@ test CellList {
     }
     cl.addPage(q);
     try std.testing.expectEqual(1, cl.chooseSplit(false));
+}
+
+test "BPTree put get delete" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const name = "pgd.bin";
+    const file = try tmp.dir.createFile(io, name, .{});
+    defer file.close(io);
+    const path = try tmp.dir.realPathFileAlloc(io, name, gpa);
+    defer gpa.free(path);
+
+    var t: BPTree = try .init(gpa, io, path);
+    defer t.deinit(gpa);
+
+    const N = 2000;
+    var order: [N]usize = undefined;
+    for (&order, 0..) |*o, i| o.* = i;
+    var prng: std.Random.DefaultPrng = .init(42);
+    prng.random().shuffle(usize, &order);
+
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [32]u8 = undefined;
+    var out: [MAX_VAL]u8 = undefined;
+
+    for (order) |i| {
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
+        const v = try std.fmt.bufPrint(&vbuf, "value-{d}-xxxxxxxxxxxxxxxx", .{i});
+        try t.put(k, v);
+    }
+    try std.testing.expectEqual(0, t.poolPinned());
+    try std.testing.expect(t.npages > 2);
+
+    // Replace the values of the even keys.
+    for (0..N) |i| {
+        if (i % 2 != 0) continue;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
+        try t.put(k, "new");
+    }
+    for (0..N) |i| {
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
+        const got = (try t.get(k, &out)).?;
+        if (i % 2 == 0) {
+            try std.testing.expectEqualStrings("new", got);
+        } else {
+            const v = try std.fmt.bufPrint(&vbuf, "value-{d}-xxxxxxxxxxxxxxxx", .{i});
+            try std.testing.expectEqualStrings(v, got);
+        }
+    }
+
+    prng.random().shuffle(usize, &order);
+    for (order, 0..) |i, n| {
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
+        try std.testing.expect(try t.delete(k));
+        try std.testing.expect(!try t.delete(k));
+        try std.testing.expectEqual(null, try t.get(k, &out));
+        if (n % 97 == 0) {
+            for (order[n + 1 ..]) |j| {
+                const kj = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{j});
+                try std.testing.expect((try t.get(kj, &out)) != null);
+            }
+        }
+    }
+    try std.testing.expectEqual(0, t.poolPinned());
+
+    const root = try t.poolGet(t.root);
+    defer t.poolUnpin(root, false);
+    try std.testing.expectEqual(.leaf, root.getType());
+    try std.testing.expectEqual(0, root.getN());
 }
