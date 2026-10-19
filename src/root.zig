@@ -225,367 +225,378 @@ const Path = struct {
     }
 };
 
-pub const BPTree = struct {
-    pool: Pool,
-    root: u32 = 0,
-    npages: u32 = 0,
-    freelist: u32 = 0,
-    /// Pages that an operation keeps pinned, so that a later access to them does no I/O.
-    held: Stack(Page, 2 * max_depth) = .{},
-    /// Pages that an operation allocates before it changes the tree.
-    spare: Stack(Page, max_depth + 2) = .{},
-    /// The cells of the pages that a split or a merge changes.
-    scratch: *CellList,
+pub fn BPTree(comptime K: type, comptime V: type) type {
+    return struct {
+        pool: Pool,
+        root: u32 = 0,
+        npages: u32 = 0,
+        freelist: u32 = 0,
+        /// Pages that an operation keeps pinned, so that a later access to them does no I/O.
+        held: Stack(Page, 2 * max_depth) = .{},
+        /// Pages that an operation allocates before it changes the tree.
+        spare: Stack(Page, max_depth + 2) = .{},
+        /// The cells of the pages that a split or a merge changes.
+        scratch: *CellList,
 
-    /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
-    /// The caller owns `file` and must keep it open until `deinit`.
-    pub fn init(gpa: Allocator, io: Io, file: Io.File) !BPTree {
-        const mem = try gpa.alloc(u8, page_size * pool_frames);
-        errdefer gpa.free(mem);
-        const scratch = try gpa.create(CellList);
-        errdefer gpa.destroy(scratch);
-        scratch.* = .{};
-        var t: BPTree = .{ .pool = .{ .io = io, .file = file, .mem = mem }, .scratch = scratch };
+        const Self = @This();
 
-        if (try file.length(io) == 0) {
-            t.npages = 1;
-            const root = try t.pageAlloc(.leaf);
-            t.root = t.pool.pgnoOf(root);
-            t.pool.unpin(root, .dirty);
-        } else {
-            try t.metaRead();
+        /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
+        /// The caller owns `file` and must keep it open until `deinit`.
+        pub fn init(gpa: Allocator, io: Io, file: Io.File) !Self {
+            const mem = try gpa.alloc(u8, page_size * pool_frames);
+            errdefer gpa.free(mem);
+            const scratch = try gpa.create(CellList);
+            errdefer gpa.destroy(scratch);
+            scratch.* = .{};
+            var t: Self = .{ .pool = .{ .io = io, .file = file, .mem = mem }, .scratch = scratch };
+
+            if (try file.length(io) == 0) {
+                t.npages = 1;
+                const root = try t.pageAlloc(.leaf);
+                t.root = t.pool.pgnoOf(root);
+                t.pool.unpin(root, .dirty);
+            } else {
+                try t.metaRead();
+            }
+
+            return t;
         }
 
-        return t;
-    }
+        /// Releases the memory. It does not close the file. Changes that `sync` did not write are lost.
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            self.pool.deinit(gpa);
+            gpa.destroy(self.scratch);
+        }
 
-    /// Releases the memory. It does not close the file. Changes that `sync` did not write are lost.
-    pub fn deinit(self: *BPTree, gpa: Allocator) void {
-        self.pool.deinit(gpa);
-        gpa.destroy(self.scratch);
-    }
+        /// Writes all changed pages and the meta page, and then syncs the file.
+        pub fn sync(self: *Self) !void {
+            try self.pool.flush();
+            try self.metaWrite();
+            try self.pool.file.sync(self.pool.io);
+        }
 
-    /// Writes all changed pages and the meta page, and then syncs the file.
-    pub fn sync(self: *BPTree) !void {
-        try self.pool.flush();
-        try self.metaWrite();
-        try self.pool.file.sync(self.pool.io);
-    }
+        fn metaWrite(self: *Self) !void {
+            var buf: [page_size]u8 = @splat(0);
+            @memcpy(buf[0..magic.len], magic);
+            put32(buf[8..], @intCast(page_size));
+            put32(buf[12..], self.root);
+            put32(buf[16..], self.npages);
+            put32(buf[20..], self.freelist);
+            try self.pool.write(meta_pgno, &buf);
+        }
 
-    fn metaWrite(self: *BPTree) !void {
-        var buf: [page_size]u8 = @splat(0);
-        @memcpy(buf[0..magic.len], magic);
-        put32(buf[8..], @intCast(page_size));
-        put32(buf[12..], self.root);
-        put32(buf[16..], self.npages);
-        put32(buf[20..], self.freelist);
-        try self.pool.write(meta_pgno, &buf);
-    }
+        fn metaRead(self: *Self) !void {
+            var buf: [page_size]u8 = undefined;
+            try self.pool.read(meta_pgno, &buf);
 
-    fn metaRead(self: *BPTree) !void {
-        var buf: [page_size]u8 = undefined;
-        try self.pool.read(meta_pgno, &buf);
+            if (!std.mem.eql(u8, magic, buf[0..magic.len]) or get32(buf[8..]) != page_size) return error.BadFile;
+            self.root = get32(buf[12..]);
+            self.npages = get32(buf[16..]);
+            self.freelist = get32(buf[20..]);
+        }
 
-        if (!std.mem.eql(u8, magic, buf[0..magic.len]) or get32(buf[8..]) != page_size) return error.BadFile;
-        self.root = get32(buf[12..]);
-        self.npages = get32(buf[16..]);
-        self.freelist = get32(buf[20..]);
-    }
+        /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
+        fn getPage(self: *Self, pgno: u32) !Page {
+            if (pgno == meta_pgno or pgno >= self.npages) return error.BadFile;
+            return self.pool.pin(pgno, .load);
+        }
 
-    /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
-    fn getPage(self: *BPTree, pgno: u32) !Page {
-        if (pgno == meta_pgno or pgno >= self.npages) return error.BadFile;
-        return self.pool.pin(pgno, .load);
-    }
-
-    fn pageAlloc(self: *BPTree, t: Page.Type) !Page {
-        if (self.freelist != 0) {
-            const p = try self.getPage(self.freelist);
-            if (p.kind() != .free) {
-                self.pool.unpin(p, .clean);
-                return error.BadFile;
+        fn pageAlloc(self: *Self, t: Page.Type) !Page {
+            if (self.freelist != 0) {
+                const p = try self.getPage(self.freelist);
+                if (p.kind() != .free) {
+                    self.pool.unpin(p, .clean);
+                    return error.BadFile;
+                }
+                self.freelist = p.link();
+                p.init(t);
+                return p;
             }
-            self.freelist = p.link();
+            const pgno = self.npages;
+            self.npages += 1;
+            errdefer self.npages -= 1;
+            const p = try self.pool.pin(pgno, .no_load);
             p.init(t);
             return p;
         }
-        const pgno = self.npages;
-        self.npages += 1;
-        errdefer self.npages -= 1;
-        const p = try self.pool.pin(pgno, .no_load);
-        p.init(t);
-        return p;
-    }
 
-    fn pageFree(self: *BPTree, p: Page) void {
-        const pgno = self.pool.pgnoOf(p);
-        p.init(.free);
-        p.setLink(self.freelist);
-        self.freelist = pgno;
-        self.pool.unpin(p, .dirty);
-    }
-
-    fn releaseHeld(self: *BPTree) void {
-        while (self.held.pop()) |p| self.pool.unpin(p, .clean);
-    }
-
-    /// Allocates `n` pages before an operation changes the tree. `takeSpare` then gives them out without I/O.
-    fn reserve(self: *BPTree, n: usize) !void {
-        for (0..n) |_| self.spare.push(try self.pageAlloc(.free));
-    }
-
-    fn takeSpare(self: *BPTree, t: Page.Type) Page {
-        const p = self.spare.pop().?;
-        p.init(t);
-        return p;
-    }
-
-    /// Frees the spare pages that the operation did not use. The reverse order puts the freelist back as it was.
-    fn releaseSpares(self: *BPTree) void {
-        while (self.spare.pop()) |p| self.pageFree(p);
-    }
-
-    /// The maximum number of new pages that a chain of splits needs when level `d` gets a cell.
-    fn splitPages(self: *BPTree, path: []const PathEntry, d: usize, splits: bool) usize {
-        if (!splits) return 0;
-        var n: usize = 1;
-        var k = d;
-        while (k > 0) {
-            k -= 1;
-            if (self.pool.heldPage(path[k].pgno).freeBytes() >= max_sep) return n;
-            n += 1;
-        }
-        return n + 1; // a new root
-    }
-
-    /// Holds the siblings that `rebalance` can use, from level `d` up.
-    /// Returns the maximum number of new pages that its redistributions need.
-    fn holdSiblings(self: *BPTree, path: []const PathEntry, d: usize) !usize {
-        var spares: usize = 0;
-        var k = d;
-        while (k > 0) : (k -= 1) {
-            const parent = self.pool.heldPage(path[k - 1].pgno);
-            const idx = path[k - 1].idx;
-            const sib = try self.getPage(parent.child(if (idx > 0) idx - 1 else idx + 1));
-            self.held.push(sib);
-            if (sib.kind() != self.pool.heldPage(path[k].pgno).kind()) return error.BadFile;
-            spares = @max(spares, self.splitPages(path, k - 1, parent.freeBytes() < max_sep));
-            // A merge or a redistribution at level k removes at most one separator from the parent.
-            if (parent.usedBytes() >= min_fill + max_sep) break;
-        }
-        return spares;
-    }
-
-    /// Holds the path from the root to the leaf for `key` until `releaseHeld`.
-    fn descend(self: *BPTree, key: []const u8) !Path {
-        errdefer self.releaseHeld();
-        var path: Path = .{};
-        var pgno = self.root;
-        while (true) {
-            const p = try self.getPage(pgno);
-            self.held.push(p);
-            const e = &path.entries[path.depth];
-            e.pgno = pgno;
-            switch (p.kind()) {
-                .leaf => {
-                    path.leaf = p;
-                    return path;
-                },
-                .internal => {},
-                else => return error.BadFile,
-            }
-            e.idx = p.childIndex(key);
-            pgno = p.child(e.idx);
-            path.depth += 1;
-            if (path.depth >= max_depth) return error.BadFile;
-        }
-    }
-
-    pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
-        if (key.len > max_key) return error.KeyTooLarge;
-        const path = try self.descend(key);
-        defer self.releaseHeld();
-        const leaf = path.leaf;
-        const r = leaf.search(key);
-        if (r.found) {
-            const val = leaf.leafVal(r.index);
-            if (out.len < val.len) return error.NoSpaceLeft;
-            @memcpy(out[0..val.len], val);
-            return out[0..val.len];
-        }
-        return null;
-    }
-
-    /// true if split. The caller holds the path and reserves the new pages.
-    fn insertUp(self: *BPTree, path: []const PathEntry, d: usize, idx: usize, c: []const u8) bool {
-        const pgno = path[d].pgno;
-        const p = self.pool.pinHeld(pgno);
-        if (p.insertCell(idx, c)) {
+        fn pageFree(self: *Self, p: Page) void {
+            const pgno = self.pool.pgnoOf(p);
+            p.init(.free);
+            p.setLink(self.freelist);
+            self.freelist = pgno;
             self.pool.unpin(p, .dirty);
-            return false;
         }
 
-        const cl = self.scratch;
-        cl.reset();
-        for (0..p.count()) |i| {
-            if (i == idx) cl.add(c);
-            cl.add(p.cell(i));
+        fn releaseHeld(self: *Self) void {
+            while (self.held.pop()) |p| self.pool.unpin(p, .clean);
         }
-        if (idx == p.count()) cl.add(c);
 
-        const leaf = p.kind() == .leaf;
-        const s = cl.chooseSplit(leaf);
-        const right = self.takeSpare(p.kind());
-        const right_pg = self.pool.pgnoOf(right);
-        var sep_buf: [max_key + 6]u8 = undefined;
-        const sep = if (leaf) blk: {
-            right.fill(.leaf, p.link(), cl, s, cl.cells.len);
-            p.fill(.leaf, right_pg, cl, 0, s);
-            break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
-        } else blk: {
-            const mid = cl.cells.items()[s];
-            right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
-            p.fill(.internal, p.link(), cl, 0, s);
-            break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
-        };
-        self.pool.unpin(right, .dirty);
-        self.pool.unpin(p, .dirty);
-
-        if (d == 0) {
-            const root = self.takeSpare(.internal);
-            root.setLink(pgno);
-            _ = root.insertCell(0, sep);
-            self.root = self.pool.pgnoOf(root);
-            self.pool.unpin(root, .dirty);
-        } else {
-            _ = self.insertUp(path, d - 1, path[d - 1].idx, sep);
+        /// Allocates `n` pages before an operation changes the tree. `takeSpare` then gives them out without I/O.
+        fn reserve(self: *Self, n: usize) !void {
+            for (0..n) |_| self.spare.push(try self.pageAlloc(.free));
         }
-        return true;
-    }
 
-    pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
-        if (key.len > max_key) return error.KeyTooLarge;
-        if (val.len > max_val) return error.ValueTooLarge;
-        const path = try self.descend(key);
-        defer self.releaseHeld();
-        const leaf = path.leaf;
-        defer self.releaseSpares();
-
-        const r = leaf.search(key);
-        const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
-        const new_sz = 4 + key.len + val.len + 2;
-        const splits = leaf.freeBytes() + old_sz < new_sz;
-        var spares = self.splitPages(path.slice(), path.depth, splits);
-        if (r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill)
-            spares = @max(spares, try self.holdSiblings(path.slice(), path.depth));
-        try self.reserve(spares);
-
-        // Nothing below can fail, so the tree changes completely or not at all.
-        if (r.found) {
-            leaf.deleteCell(r.index);
-            self.pool.markDirty(leaf);
+        fn takeSpare(self: *Self, t: Page.Type) Page {
+            const p = self.spare.pop().?;
+            p.init(t);
+            return p;
         }
-        var c: [4 + max_key + max_val]u8 = undefined;
-        const split = self.insertUp(path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
-        std.debug.assert(split == splits);
-        if (r.found and !split)
-            self.rebalance(path.slice(), path.depth);
-    }
 
-    /// The caller holds the path and the siblings, and reserves the new pages.
-    fn rebalance(self: *BPTree, path: []const PathEntry, d: usize) void {
-        const p = self.pool.pinHeld(path[d].pgno);
+        /// Frees the spare pages that the operation did not use. The reverse order puts the freelist back as it was.
+        fn releaseSpares(self: *Self) void {
+            while (self.spare.pop()) |p| self.pageFree(p);
+        }
 
-        if (d == 0) {
-            if (p.kind() == .internal and p.count() == 0) {
-                self.root = p.link();
-                self.pageFree(p);
-            } else {
-                self.pool.unpin(p, .clean);
+        /// The maximum number of new pages that a chain of splits needs when level `d` gets a cell.
+        fn splitPages(self: *Self, path: []const PathEntry, d: usize, splits: bool) usize {
+            if (!splits) return 0;
+            var n: usize = 1;
+            var k = d;
+            while (k > 0) {
+                k -= 1;
+                if (self.pool.heldPage(path[k].pgno).freeBytes() >= max_sep) return n;
+                n += 1;
             }
-            return;
+            return n + 1; // a new root
         }
 
-        if (p.usedBytes() >= min_fill) {
+        /// Holds the siblings that `rebalance` can use, from level `d` up.
+        /// Returns the maximum number of new pages that its redistributions need.
+        fn holdSiblings(self: *Self, path: []const PathEntry, d: usize) !usize {
+            var spares: usize = 0;
+            var k = d;
+            while (k > 0) : (k -= 1) {
+                const parent = self.pool.heldPage(path[k - 1].pgno);
+                const idx = path[k - 1].idx;
+                const sib = try self.getPage(parent.child(if (idx > 0) idx - 1 else idx + 1));
+                self.held.push(sib);
+                if (sib.kind() != self.pool.heldPage(path[k].pgno).kind()) return error.BadFile;
+                spares = @max(spares, self.splitPages(path, k - 1, parent.freeBytes() < max_sep));
+                // A merge or a redistribution at level k removes at most one separator from the parent.
+                if (parent.usedBytes() >= min_fill + max_sep) break;
+            }
+            return spares;
+        }
+
+        /// Holds the path from the root to the leaf for `key` until `releaseHeld`.
+        fn descend(self: *Self, key: []const u8) !Path {
+            errdefer self.releaseHeld();
+            var path: Path = .{};
+            var pgno = self.root;
+            while (true) {
+                const p = try self.getPage(pgno);
+                self.held.push(p);
+                const e = &path.entries[path.depth];
+                e.pgno = pgno;
+                switch (p.kind()) {
+                    .leaf => {
+                        path.leaf = p;
+                        return path;
+                    },
+                    .internal => {},
+                    else => return error.BadFile,
+                }
+                e.idx = p.childIndex(key);
+                pgno = p.child(e.idx);
+                path.depth += 1;
+                if (path.depth >= max_depth) return error.BadFile;
+            }
+        }
+
+        pub fn get(self: *Self, key: []const u8, out: []u8) !?[]u8 {
+            if (key.len > max_key) return error.KeyTooLarge;
+            var pgno = self.root;
+            for (0..max_depth) |_| {
+                const p = try self.getPage(pgno);
+                defer self.pool.unpin(p, .clean);
+                switch (p.kind()) {
+                    .internal => pgno = p.child(p.childIndex(key)),
+                    .leaf => {
+                        const r = p.search(key);
+                        if (!r.found) return null;
+                        const val = p.leafVal(r.index);
+                        if (out.len < val.len) return error.NoSpaceLeft;
+                        @memcpy(out[0..val.len], val);
+                        return out[0..val.len];
+                    },
+                    else => error.BadFile,
+                }
+            }
+            return error.BadFile;
+        }
+
+        /// true if split. The caller holds the path and reserves the new pages.
+        fn insertUp(self: *Self, path: []const PathEntry, d: usize, idx: usize, c: []const u8) bool {
+            const pgno = path[d].pgno;
+            const p = self.pool.pinHeld(pgno);
+            if (p.insertCell(idx, c)) {
+                self.pool.unpin(p, .dirty);
+                return false;
+            }
+
+            const cl = self.scratch;
+            cl.reset();
+            for (0..p.count()) |i| {
+                if (i == idx) cl.add(c);
+                cl.add(p.cell(i));
+            }
+            if (idx == p.count()) cl.add(c);
+
+            const leaf = p.kind() == .leaf;
+            const s = cl.chooseSplit(leaf);
+            const right = self.takeSpare(p.kind());
+            const right_pg = self.pool.pgnoOf(right);
+            var sep_buf: [max_key + 6]u8 = undefined;
+            const sep = if (leaf) blk: {
+                right.fill(.leaf, p.link(), cl, s, cl.cells.len);
+                p.fill(.leaf, right_pg, cl, 0, s);
+                break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
+            } else blk: {
+                const mid = cl.cells.items()[s];
+                right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
+                p.fill(.internal, p.link(), cl, 0, s);
+                break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
+            };
+            self.pool.unpin(right, .dirty);
+            self.pool.unpin(p, .dirty);
+
+            if (d == 0) {
+                const root = self.takeSpare(.internal);
+                root.setLink(pgno);
+                _ = root.insertCell(0, sep);
+                self.root = self.pool.pgnoOf(root);
+                self.pool.unpin(root, .dirty);
+            } else {
+                _ = self.insertUp(path, d - 1, path[d - 1].idx, sep);
+            }
+            return true;
+        }
+
+        pub fn put(self: *Self, key: []const u8, val: []const u8) !void {
+            if (key.len > max_key) return error.KeyTooLarge;
+            if (val.len > max_val) return error.ValueTooLarge;
+            const path = try self.descend(key);
+            defer self.releaseHeld();
+            const leaf = path.leaf;
+            defer self.releaseSpares();
+
+            const r = leaf.search(key);
+            const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
+            const new_sz = 4 + key.len + val.len + 2;
+            const splits = leaf.freeBytes() + old_sz < new_sz;
+            var spares = self.splitPages(path.slice(), path.depth, splits);
+            if (r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill)
+                spares = @max(spares, try self.holdSiblings(path.slice(), path.depth));
+            try self.reserve(spares);
+
+            // Nothing below can fail, so the tree changes completely or not at all.
+            if (r.found) {
+                leaf.deleteCell(r.index);
+                self.pool.markDirty(leaf);
+            }
+            var c: [4 + max_key + max_val]u8 = undefined;
+            const split = self.insertUp(path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
+            std.debug.assert(split == splits);
+            if (r.found and !split)
+                self.rebalance(path.slice(), path.depth);
+        }
+
+        /// The caller holds the path and the siblings, and reserves the new pages.
+        fn rebalance(self: *Self, path: []const PathEntry, d: usize) void {
+            const p = self.pool.pinHeld(path[d].pgno);
+
+            if (d == 0) {
+                if (p.kind() == .internal and p.count() == 0) {
+                    self.root = p.link();
+                    self.pageFree(p);
+                } else {
+                    self.pool.unpin(p, .clean);
+                }
+                return;
+            }
+
+            if (p.usedBytes() >= min_fill) {
+                self.pool.unpin(p, .clean);
+                return;
+            }
             self.pool.unpin(p, .clean);
-            return;
-        }
-        self.pool.unpin(p, .clean);
 
-        const parent = self.pool.pinHeld(path[d - 1].pgno);
-        const idx = path[d - 1].idx;
-        const li = if (idx > 0) idx - 1 else idx;
-        const sep_idx = li;
-        const left = self.pool.pinHeld(parent.child(li));
-        const right = self.pool.pinHeld(parent.child(li + 1));
-        const leaf = left.kind() == .leaf;
+            const parent = self.pool.pinHeld(path[d - 1].pgno);
+            const idx = path[d - 1].idx;
+            const li = if (idx > 0) idx - 1 else idx;
+            const sep_idx = li;
+            const left = self.pool.pinHeld(parent.child(li));
+            const right = self.pool.pinHeld(parent.child(li + 1));
+            const leaf = left.kind() == .leaf;
 
-        const cl = self.scratch;
-        cl.reset();
-        cl.addPage(left);
-        if (!leaf) {
-            const k = parent.cellKey(sep_idx);
-            var c: [max_key + 6]u8 = undefined;
-            cl.add(makeInternalCell(&c, right.link(), k));
-        }
-        cl.addPage(right);
+            const cl = self.scratch;
+            cl.reset();
+            cl.addPage(left);
+            if (!leaf) {
+                const k = parent.cellKey(sep_idx);
+                var c: [max_key + 6]u8 = undefined;
+                cl.add(makeInternalCell(&c, right.link(), k));
+            }
+            cl.addPage(right);
 
-        // merge into left
-        if (cl.bytes(0, cl.cells.len) <= capacity) {
-            const link = if (leaf) right.link() else left.link();
-            left.fill(left.kind(), link, cl, 0, cl.cells.len);
-            self.pageFree(right);
+            // merge into left
+            if (cl.bytes(0, cl.cells.len) <= capacity) {
+                const link = if (leaf) right.link() else left.link();
+                left.fill(left.kind(), link, cl, 0, cl.cells.len);
+                self.pageFree(right);
+                self.pool.unpin(left, .dirty);
+                parent.deleteCell(sep_idx);
+                self.pool.unpin(parent, .dirty);
+                self.rebalance(path, d - 1);
+                return;
+            }
+
+            // split evenly
+            const s = cl.chooseSplit(leaf);
+            var sep_buf: [max_key + 6]u8 = undefined;
+            const right_pg = self.pool.pgnoOf(right);
+            const sep = if (leaf) blk: {
+                left.fill(.leaf, right_pg, cl, 0, s);
+                right.fill(.leaf, right.link(), cl, s, cl.cells.len);
+                break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
+            } else blk: {
+                const mid = cl.cells.items()[s];
+                left.fill(.internal, left.link(), cl, 0, s);
+                right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
+                break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
+            };
             self.pool.unpin(left, .dirty);
+            self.pool.unpin(right, .dirty);
             parent.deleteCell(sep_idx);
             self.pool.unpin(parent, .dirty);
-            self.rebalance(path, d - 1);
-            return;
+
+            if (!self.insertUp(path, d - 1, sep_idx, sep)) {
+                self.rebalance(path, d - 1);
+            }
         }
 
-        // split evenly
-        const s = cl.chooseSplit(leaf);
-        var sep_buf: [max_key + 6]u8 = undefined;
-        const right_pg = self.pool.pgnoOf(right);
-        const sep = if (leaf) blk: {
-            left.fill(.leaf, right_pg, cl, 0, s);
-            right.fill(.leaf, right.link(), cl, s, cl.cells.len);
-            break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
-        } else blk: {
-            const mid = cl.cells.items()[s];
-            left.fill(.internal, left.link(), cl, 0, s);
-            right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
-            break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
-        };
-        self.pool.unpin(left, .dirty);
-        self.pool.unpin(right, .dirty);
-        parent.deleteCell(sep_idx);
-        self.pool.unpin(parent, .dirty);
+        pub fn delete(self: *Self, key: []const u8) !bool {
+            if (key.len > max_key) return error.KeyTooLarge;
+            const path = try self.descend(key);
+            defer self.releaseHeld();
+            const leaf = path.leaf;
+            defer self.releaseSpares();
 
-        if (!self.insertUp(path, d - 1, sep_idx, sep)) {
-            self.rebalance(path, d - 1);
+            const r = leaf.search(key);
+            if (!r.found) return false;
+            const old_sz = leaf.cell(r.index).len + 2;
+            if (leaf.usedBytes() - old_sz < min_fill)
+                try self.reserve(try self.holdSiblings(path.slice(), path.depth));
+
+            // Nothing below can fail, so the tree changes completely or not at all.
+            leaf.deleteCell(r.index);
+            self.pool.markDirty(leaf);
+            self.rebalance(path.slice(), path.depth);
+            return true;
         }
-    }
-
-    pub fn delete(self: *BPTree, key: []const u8) !bool {
-        if (key.len > max_key) return error.KeyTooLarge;
-        const path = try self.descend(key);
-        defer self.releaseHeld();
-        const leaf = path.leaf;
-        defer self.releaseSpares();
-
-        const r = leaf.search(key);
-        if (!r.found) return false;
-        const old_sz = leaf.cell(r.index).len + 2;
-        if (leaf.usedBytes() - old_sz < min_fill)
-            try self.reserve(try self.holdSiblings(path.slice(), path.depth));
-
-        // Nothing below can fail, so the tree changes completely or not at all.
-        leaf.deleteCell(r.index);
-        self.pool.markDirty(leaf);
-        self.rebalance(path.slice(), path.depth);
-        return true;
-    }
-};
+    };
+}
 
 const Page = struct {
     page: *[page_size]u8,
