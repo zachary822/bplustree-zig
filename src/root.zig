@@ -227,6 +227,8 @@ const Path = struct {
 
 pub fn BPTree(comptime K: type, comptime V: type) type {
     return struct {
+        const Self = @This();
+
         pool: Pool,
         root: u32 = 0,
         npages: u32 = 0,
@@ -237,8 +239,6 @@ pub fn BPTree(comptime K: type, comptime V: type) type {
         spare: Stack(Page, max_depth + 2) = .{},
         /// The cells of the pages that a split or a merge changes.
         scratch: *CellList,
-
-        const Self = @This();
 
         /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
         /// The caller owns `file` and must keep it open until `deinit`.
