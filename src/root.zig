@@ -64,14 +64,12 @@ pub const BPTree = struct {
     reads: u64 = 0,
     writes: u64 = 0,
 
-    pub fn init(gpa: Allocator, io: Io, path: []const u8) !*BPTree {
-        const t = try gpa.create(BPTree);
-        errdefer gpa.destroy(t);
+    pub fn init(gpa: Allocator, io: Io, path: []const u8) !BPTree {
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
         errdefer file.close(io);
         const mem = try gpa.alloc(u8, PAGE_SIZE * POOL_FRAMES);
         errdefer gpa.free(mem);
-        t.* = .{ .io = io, .file = file, .mem = mem };
+        var t: BPTree = .{ .io = io, .file = file, .mem = mem };
 
         const size = try file.length(io);
 
@@ -94,7 +92,6 @@ pub const BPTree = struct {
         self.file.sync(self.io) catch |err| std.debug.panic("fsync: {t}", .{err});
         self.file.close(self.io);
         gpa.free(self.mem);
-        gpa.destroy(self);
     }
 
     fn diskRead(self: *BPTree, pgno: u32, buf: []u8) !void {
@@ -273,7 +270,6 @@ pub const BPTree = struct {
         return null;
     }
 
-    /// returns true if split happened
     fn insertUp(self: *BPTree, path: []const PathEntry, d: usize, idx: usize, c: []const u8) !bool {
         const pgno = path[d].pgno;
         const p = try self.poolGet(pgno);
@@ -577,7 +573,7 @@ test BPTree {
     const path = try tmp.dir.realPathFileAlloc(io, name, gpa);
     defer gpa.free(path);
 
-    const t: *BPTree = try .init(gpa, io, path);
+    var t: BPTree = try .init(gpa, io, path);
     defer t.deinit(gpa);
 
     try t.metaWrite();
@@ -652,7 +648,7 @@ test "BPTree pool" {
     const path = try tmp.dir.realPathFileAlloc(io, name, gpa);
     defer gpa.free(path);
 
-    const t: *BPTree = try .init(gpa, io, path);
+    var t: BPTree = try .init(gpa, io, path);
     defer t.deinit(gpa);
 
     t.npages = POOL_FRAMES + 4;
@@ -684,7 +680,7 @@ test "BPTree page alloc" {
     const path = try tmp.dir.realPathFileAlloc(io, name, gpa);
     defer gpa.free(path);
 
-    const t: *BPTree = try .init(gpa, io, path);
+    var t: BPTree = try .init(gpa, io, path);
     defer t.deinit(gpa);
 
     // open allocates the root leaf as page 1.
@@ -722,7 +718,7 @@ test "BPTree get" {
     const path = try tmp.dir.realPathFileAlloc(io, name, gpa);
     defer gpa.free(path);
 
-    const t: *BPTree = try .init(gpa, io, path);
+    var t: BPTree = try .init(gpa, io, path);
     defer t.deinit(gpa);
 
     // Make a two-level tree by hand: the root holds "m", with "a" on the left and "m", "z" on the right.
