@@ -24,11 +24,14 @@ pub fn build(b: *std.Build) void {
     const page_size = b.option(usize, "page_size", "Size of b+ tree page.") orelse 4096;
     const pool_frames = b.option(usize, "pool_frames", "Size of b+ tree pool") orelse 16;
     const pool_paranoid = b.option(bool, "paranoid", "Paranoid mode") orelse false;
+    const disk_delay_us = b.option(u32, "disk_delay_us", "Sleep this long in every page read and wirte") orelse 0;
+    const tsan = b.option(bool, "tsan", "Build with ThreadSanitizer") orelse false;
 
     const options = b.addOptions();
     options.addOption(usize, "page_size", page_size);
     options.addOption(usize, "pool_frames", pool_frames);
     options.addOption(bool, "pool_paranoid", pool_paranoid);
+    options.addOption(u32, "disk_delay_us", disk_delay_us);
 
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
@@ -48,6 +51,8 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .optimize = optimize,
+        .sanitize_thread = tsan,
     });
     mod.addOptions("build_options", options);
 
@@ -122,6 +127,28 @@ pub fn build(b: *std.Build) void {
     // This allows the user to pass arguments to the application in the build
     // command itself, like this: `zig build run -- arg1 arg2 etc`
     run_cmd.addPassthruArgs();
+
+    // The stress test and benchmark. Pass the mode and its arguments after `--`,
+    // like this: `zig build stress -- bench 4 90 50000`
+    const stress_exe = b.addExecutable(.{
+        .name = "stress",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/stress.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = tsan,
+            .imports = &.{
+                .{ .name = "bplustree_zig", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(stress_exe);
+
+    const stress_step = b.step("stress", "Run the stress test or the benchmark");
+    const stress_cmd = b.addRunArtifact(stress_exe);
+    stress_step.dependOn(&stress_cmd.step);
+    stress_cmd.step.dependOn(b.getInstallStep());
+    stress_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
