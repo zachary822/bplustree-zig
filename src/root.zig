@@ -646,8 +646,8 @@ pub const BPTree = struct {
         ctx: anytype,
         comptime visit: fn (ctx: @TypeOf(ctx), key: []const u8, val: []const u8) anyerror!void,
     ) !usize {
-        self.mu.lockUncancelable(self.pool.io);
-        defer self.mu.unlock(self.pool.io);
+        self.tree_lock.lockSharedUncancelable(self.pool.io);
+        defer self.tree_lock.unlockShared(self.pool.io);
         var op: Op = .{};
         const path = try self.descend(&op, lo orelse "");
         defer self.releaseHeld(&op);
