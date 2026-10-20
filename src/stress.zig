@@ -45,6 +45,12 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.panic("stress: " ++ fmt, args);
 }
 
+/// The number `k` in a key that `keyOf` made, or null.
+fn keyNum(key: []const u8) ?usize {
+    if (key.len != 11 or !std.mem.startsWith(u8, key, "key")) return null;
+    return std.fmt.parseInt(usize, key[3..], 10) catch null;
+}
+
 const Shared = struct {
     t: *bpt.BPTree,
     threads: usize,
@@ -64,6 +70,40 @@ const Shared = struct {
     }
 };
 
+/// Checks one scan of the keys `lo..hi`. The keys must come in order and inside the bounds, and each value must be whole.
+/// The keys that thread `id` writes must be exactly the ones it put, with their last versions.
+/// If `id` is null, no thread runs, so all keys must be exactly as the writers put them.
+const ScanCheck = struct {
+    sh: *Shared,
+    id: ?usize,
+    lo: usize,
+    hi: usize,
+    /// The smallest key that the scan can give next.
+    next: usize,
+    n: usize = 0,
+
+    fn owns(c: *const ScanCheck, k: usize) bool {
+        return if (c.id) |id| k % c.sh.threads == id else true;
+    }
+
+    fn visit(c: *ScanCheck, key: []const u8, val: []const u8) anyerror!void {
+        const k = keyNum(key) orelse fail("scan {d}..{d}: bad key {s}", .{ c.lo, c.hi, key });
+        if (k < c.next or k > c.hi) fail("scan {d}..{d}: key {d} after key {d}", .{ c.lo, c.hi, k, c.next -| 1 });
+        c.missing(k);
+        const ver = valVersion(val, k) orelse fail("scan {d}..{d}: key {d} has a torn or wrong value", .{ c.lo, c.hi, k });
+        if (c.owns(k) and ver != c.sh.vers[k]) fail("scan {d}..{d}: key {d} has version {d}, put {d}", .{ c.lo, c.hi, k, ver, c.sh.vers[k] });
+        c.next = k + 1;
+        c.n += 1;
+    }
+
+    /// Fails if the scan skipped a key before `end` that it must give.
+    fn missing(c: *const ScanCheck, end: usize) void {
+        for (c.next..end) |k| {
+            if (c.owns(k) and c.sh.vers[k] != 0) fail("scan {d}..{d}: key {d} is missing", .{ c.lo, c.hi, k });
+        }
+    }
+};
+
 fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
     const t = sh.t;
     var prng: std.Random.DefaultPrng = .init(seed);
@@ -75,7 +115,7 @@ fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
 
     for (0..sh.ops) |_| {
         const roll = rand.uintLessThan(usize, 100);
-        if (roll < 50) {
+        if (roll < 40) {
             // Get any key. A key that another thread writes can have any version, but it must be whole.
             const k = rand.uintLessThan(usize, test_keys);
             const got = while (true) break t.get(keyOf(&kbuf, k), &out) catch |err| {
@@ -86,6 +126,25 @@ fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
                 const ver = valVersion(v, k) orelse fail("get {d}: a torn or wrong value", .{k});
                 if (k % sh.threads == id and ver != sh.vers[k]) fail("get {d}: version {d}, put {d}", .{ k, ver, sh.vers[k] });
             } else if (k % sh.threads == id and sh.vers[k] != 0) fail("get {d}: missing", .{k});
+            continue;
+        }
+        if (roll < 50) {
+            // Scan a range of up to 256 keys, while the other threads write into it.
+            const lo = rand.uintLessThan(usize, test_keys);
+            const hi = @min(test_keys - 1, lo + rand.uintLessThan(usize, 256));
+            var lbuf: [16]u8 = undefined;
+            var hbuf: [16]u8 = undefined;
+            var c: ScanCheck = undefined;
+            const n = while (true) {
+                // A scan that fails part of the way can visit keys before it fails, so start the check again.
+                c = .{ .sh = sh, .id = id, .lo = lo, .hi = hi, .next = lo };
+                break t.scan(keyOf(&lbuf, lo), keyOf(&hbuf, hi), &c, ScanCheck.visit) catch |err| {
+                    try sh.again(err);
+                    continue;
+                };
+            };
+            c.missing(hi + 1);
+            if (n != c.n) fail("scan {d}..{d}: gives {d} keys, but visited {d}", .{ lo, hi, n, c.n });
             continue;
         }
 
@@ -214,6 +273,10 @@ pub fn main(init: std.process.Init) !void {
                     present += 1;
                 }
             }
+            var c: ScanCheck = .{ .sh = &sh, .id = null, .lo = 0, .hi = test_keys - 1, .next = 0 };
+            const n = try t.scan(null, null, &c, ScanCheck.visit);
+            c.missing(test_keys);
+            if (n != present) fail("scan of all keys gives {d} keys, but {d} are in the tree", .{ n, present });
             std.debug.print("round {d}: ok, {d} keys\n", .{ round, present });
         }
         std.debug.print("stress test passed: {d} threads, {d} ops each, {d} rounds, {d} retries\n", .{ sh.threads, sh.ops, rounds, sh.retries.raw });

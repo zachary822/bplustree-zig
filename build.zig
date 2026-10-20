@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     const page_size = b.option(usize, "page_size", "Size of b+ tree page.") orelse 4096;
     const pool_frames = b.option(usize, "pool_frames", "Size of b+ tree pool") orelse 16;
     const pool_paranoid = b.option(bool, "paranoid", "Paranoid mode") orelse false;
-    const disk_delay_us = b.option(u32, "disk_delay_us", "Sleep this long in every page read and wirte") orelse 0;
+    const disk_delay_us = b.option(u32, "disk_delay_us", "Sleep this long in every page read and write") orelse 0;
     const tsan = b.option(bool, "tsan", "Build with ThreadSanitizer") orelse false;
 
     const options = b.addOptions();
@@ -85,6 +85,7 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = tsan,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{

@@ -85,8 +85,8 @@ const Pool = struct {
     frames: [pool_frames]Frame = @splat(.{}),
     mem: []u8,
     tick: u64 = 0,
-    reads: u64 = 0,
-    writes: u64 = 0,
+    reads: std.atomic.Value(u64) = .init(0),
+    writes: std.atomic.Value(u64) = .init(0),
 
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -101,14 +101,16 @@ const Pool = struct {
     }
 
     fn read(self: *Pool, pgno: u32, buf: *[page_size]u8) !void {
+        self.delay();
         const n = try self.file.readPositionalAll(self.io, buf, @as(u64, pgno) * page_size);
         if (n < page_size) @memset(buf[n..], 0);
-        self.reads += 1;
+        _ = self.reads.fetchAdd(1, .monotonic);
     }
 
     fn write(self: *Pool, pgno: u32, buf: *const [page_size]u8) !void {
+        self.delay();
         try self.file.writePositionalAll(self.io, buf, @as(u64, pgno) * page_size);
-        self.writes += 1;
+        _ = self.writes.fetchAdd(1, .monotonic);
     }
 
     fn frameData(self: *Pool, f: usize) *[page_size]u8 {
@@ -305,6 +307,12 @@ const Held = struct {
     mode: Latch,
 };
 
+const Descent = enum {
+    read,
+    optimistic,
+    write,
+};
+
 const Op = struct {
     held: Stack(Held, 2 * max_depth) = .{},
     top: usize = 0,
@@ -495,8 +503,9 @@ pub const BPTree = struct {
     }
 
     /// Holds the path from the root to the leaf for `key` until `releaseHeld`.
-    fn descend(self: *BPTree, op: *Op, key: []const u8, mode: Latch) !Path {
+    fn descend(self: *BPTree, op: *Op, key: []const u8, how: Descent) !Path {
         errdefer self.releaseHeld(op);
+        const mode: Latch = if (how == .write) .exclusive else .shared;
         self.lockRoot(op, mode);
         var path: Path = .{};
         var pgno = self.root;
@@ -506,7 +515,12 @@ pub const BPTree = struct {
             op.held.push(.{ .page = p, .mode = mode });
             const e = &path.entries[path.depth];
             e.pgno = pgno;
-            if (mode == .shared or p.kind() == .internal and isSafe(p, path.depth == 0))
+            if (how == .optimistic and p.kind() == .leaf) {
+                self.pool.unlatch(p, .shared);
+                self.pool.latch(p, .exclusive);
+                op.held.buf[op.held.len - 1].mode = .exclusive;
+            }
+            if (how != .write or p.kind() == .internal and isSafe(p, path.depth == 0))
                 self.releaseAbove(op);
             switch (p.kind()) {
                 .leaf => {
@@ -526,7 +540,7 @@ pub const BPTree = struct {
     pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
         var op: Op = .{};
-        const path = try self.descend(&op, key, .shared);
+        const path = try self.descend(&op, key, .read);
         defer self.releaseHeld(&op);
         const leaf = path.leaf;
         const r = leaf.search(key);
@@ -576,6 +590,7 @@ pub const BPTree = struct {
         self.pool.unpin(p, .dirty);
 
         if (d == 0) {
+            std.debug.assert(op.root_latch == .exclusive);
             const root = takeSpare(op, .internal);
             root.setLink(pgno);
             _ = root.insertCell(0, sep);
@@ -587,25 +602,26 @@ pub const BPTree = struct {
         return true;
     }
 
-    pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
-        if (key.len > max_key) return error.KeyTooLarge;
-        if (val.len > max_val) return error.ValueTooLarge;
-        var op: Op = .{};
-        const path = try self.descend(&op, key, .exclusive);
-        defer self.releaseHeld(&op);
+    fn putIn(self: *BPTree, op: *Op, key: []const u8, val: []const u8, how: Descent) !bool {
+        const path = try self.descend(op, key, how);
+        defer self.releaseHeld(op);
         const leaf = path.leaf;
-        defer self.releaseSpares(&op);
+        defer self.releaseSpares(op);
 
         const r = leaf.search(key);
         const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
         const new_sz = 4 + key.len + val.len + 2;
         const splits = leaf.freeBytes() + old_sz < new_sz;
         const underflows = r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill;
-        if (!splits and !underflows) self.releaseAbove(&op);
+        if (!splits and !underflows) {
+            self.releaseAbove(op);
+        } else if (how == .optimistic) {
+            return false;
+        }
         var spares = self.splitPages(path.slice(), path.depth, splits);
         if (underflows)
-            spares = @max(spares, try self.holdSiblings(&op, path.slice(), path.depth));
-        try self.reserve(&op, spares);
+            spares = @max(spares, try self.holdSiblings(op, path.slice(), path.depth));
+        try self.reserve(op, spares);
 
         // Nothing below can fail, so the tree changes completely or not at all.
         if (r.found) {
@@ -613,10 +629,19 @@ pub const BPTree = struct {
             self.pool.markDirty(leaf);
         }
         var c: [4 + max_key + max_val]u8 = undefined;
-        const split = self.insertUp(&op, path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
+        const split = self.insertUp(op, path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
         std.debug.assert(split == splits);
         if (r.found and !split)
-            self.rebalance(&op, path.slice(), path.depth);
+            self.rebalance(op, path.slice(), path.depth);
+        return true;
+    }
+
+    pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
+        if (key.len > max_key) return error.KeyTooLarge;
+        if (val.len > max_val) return error.ValueTooLarge;
+        var op: Op = .{};
+        if (try self.putIn(&op, key, val, .optimistic)) return;
+        _ = try self.putIn(&op, key, val, .write);
     }
 
     /// The caller holds the path and the siblings, and reserves the new pages.
@@ -695,28 +720,34 @@ pub const BPTree = struct {
         }
     }
 
-    pub fn delete(self: *BPTree, key: []const u8) !bool {
-        if (key.len > max_key) return error.KeyTooLarge;
-        var op: Op = .{};
-        const path = try self.descend(&op, key, .exclusive);
-        defer self.releaseHeld(&op);
+    fn deleteIn(self: *BPTree, op: *Op, key: []const u8, how: Descent) !?bool {
+        const path = try self.descend(op, key, how);
+        defer self.releaseHeld(op);
         const leaf = path.leaf;
-        defer self.releaseSpares(&op);
+        defer self.releaseSpares(op);
 
         const r = leaf.search(key);
         if (!r.found) return false;
         const old_sz = leaf.cell(r.index).len + 2;
         if (leaf.usedBytes() - old_sz < min_fill) {
-            try self.reserve(&op, try self.holdSiblings(&op, path.slice(), path.depth));
+            if (how == .optimistic) return null;
+            try self.reserve(op, try self.holdSiblings(op, path.slice(), path.depth));
         } else {
-            self.releaseAbove(&op);
+            self.releaseAbove(op);
         }
 
         // Nothing below can fail, so the tree changes completely or not at all.
         leaf.deleteCell(r.index);
         self.pool.markDirty(leaf);
-        self.rebalance(&op, path.slice(), path.depth);
+        self.rebalance(op, path.slice(), path.depth);
         return true;
+    }
+
+    pub fn delete(self: *BPTree, key: []const u8) !bool {
+        if (key.len > max_key) return error.KeyTooLarge;
+        var op: Op = .{};
+        if (try self.deleteIn(&op, key, .optimistic)) |found| return found;
+        return (try self.deleteIn(&op, key, .write)).?;
     }
 
     /// Calls `visit` for each key in `lo..hi`, both inclusive. A null bound has no limit.
@@ -735,7 +766,7 @@ pub const BPTree = struct {
 
         restart: while (true) {
             var op: Op = .{};
-            const path = try self.descend(&op, lo orelse "", .shared);
+            const path = try self.descend(&op, start, .read);
             _ = op.held.pop();
             self.releaseHeld(&op);
             var leaf = path.leaf;
@@ -828,7 +859,7 @@ pub const BPTree = struct {
             },
             .internal => {
                 if (n == 0)
-                    return checkFail("interal page {d} has no keys", .{pgno});
+                    return checkFail("internal page {d} has no keys", .{pgno});
                 for (0..n + 1) |i| {
                     const clo = if (i == 0) lo else p.cellKey(i - 1);
                     const chi = if (i == n) hi else p.cellKey(i);
@@ -1280,7 +1311,7 @@ test "BPTree get" {
     try std.testing.expectError(error.KeyTooLarge, t.get(&long_key, &buf));
 
     var op: Op = .{};
-    const path = try t.descend(&op, "z", .exclusive);
+    const path = try t.descend(&op, "z", .write);
     defer t.releaseHeld(&op);
     try std.testing.expectEqual(1, path.depth);
     try std.testing.expectEqual(t.root, path.entries[0].pgno);
@@ -1354,6 +1385,7 @@ test "BPTree put get delete" {
     }
     try std.testing.expectEqual(0, t.pool.pinned());
     try std.testing.expect(t.npages > 2);
+    try t.check(std.testing.allocator);
 
     // Replace the values of the even keys.
     for (0..N) |i| {
@@ -1386,6 +1418,7 @@ test "BPTree put get delete" {
         }
     }
     try std.testing.expectEqual(0, t.pool.pinned());
+    try t.check(std.testing.allocator);
 
     const root = try t.getPage(t.root);
     defer t.pool.unpin(root, .clean);
@@ -1478,21 +1511,22 @@ test "BPTree failed operation does not change the tree" {
     // so that only the path fits in the pool.
     const Pinner = struct {
         fn pinAllBut(tree: *BPTree, key: []const u8, pinned: *[pool_frames]Page) !usize {
-            var op: Op = .{};
-            const path = try tree.descend(&op, key, .exclusive);
-            defer tree.releaseHeld(&op);
-            const p = path.slice();
+            // Walk the path by hand. descend releases the safe pages above the leaf, so it cannot give their children.
             var skip: Stack(u32, 2 * max_depth) = .{};
-            for (p, 0..) |e, k| {
-                skip.push(e.pgno);
-                if (k == 0) continue;
-                const parent = tree.pool.heldPage(p[k - 1].pgno);
-                const idx = p[k - 1].idx;
-                skip.push(parent.child(if (idx > 0) idx - 1 else idx + 1));
+            var levels: usize = 0;
+            var pg = tree.root;
+            while (true) : (levels += 1) {
+                const p = try tree.getPage(pg);
+                defer tree.pool.unpin(p, .clean);
+                skip.push(pg);
+                if (p.kind() == .leaf) break;
+                const idx = p.childIndex(key);
+                skip.push(p.child(if (idx > 0) idx - 1 else idx + 1));
+                pg = p.child(idx);
             }
             var count: usize = 0;
-            var pg: u32 = 1;
-            while (count < pool_frames - p.len) : (pg += 1) {
+            pg = 1;
+            while (count < pool_frames - (levels + 1)) : (pg += 1) {
                 if (std.mem.indexOfScalar(u32, skip.items(), pg) != null) continue;
                 pinned[count] = try tree.getPage(pg);
                 count += 1;
