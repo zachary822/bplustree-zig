@@ -74,6 +74,7 @@ const Frame = struct {
     pgno: ?u32 = null,
     pins: u32 = 0,
     dirty: bool = false,
+    busy: bool = false,
     last_used: u64 = 0,
 };
 
@@ -86,6 +87,9 @@ const Pool = struct {
     tick: u64 = 0,
     reads: u64 = 0,
     writes: u64 = 0,
+
+    mu: Io.Mutex = .init,
+    cond: Io.Condition = .init,
 
     const Load = enum { load, no_load };
     const Unpin = enum { clean, dirty };
@@ -142,20 +146,39 @@ const Pool = struct {
 
     fn pin(self: *Pool, pgno: u32, mode: Load) !Page {
         std.debug.assert(pgno != meta_pgno);
-        if (self.find(pgno)) |f| {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        while (self.find(pgno)) |f| {
             const fr = &self.frames[f];
+            if (fr.busy) {
+                self.cond.waitUncancelable(self.io, &self.mu);
+                continue;
+            }
             fr.pins += 1;
             self.touch(fr);
             return .{ .page = self.frameData(f) };
         }
         const f = try self.victim();
-        if (mode == .load) try self.read(pgno, self.frameData(f));
-        self.frames[f] = .{ .pgno = pgno, .pins = 1 };
-        self.touch(&self.frames[f]);
+        const fr = &self.frames[f];
+        fr.* = .{ .pgno = pgno, .pins = 1, .busy = mode == .load };
+        self.touch(fr);
+        if (mode == .load) {
+            self.mu.unlock(self.io);
+            const result = self.read(pgno, self.frameData(f));
+            self.mu.lockUncancelable(self.io);
+            fr.busy = false;
+            self.cond.broadcast(self.io);
+            result catch |err| {
+                fr.* = .{};
+                return err;
+            };
+        }
         return .{ .page = self.frameData(f) };
     }
 
     fn unpin(self: *Pool, p: Page, mode: Unpin) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         const fr = self.frameOf(p);
         std.debug.assert(fr.pgno != null and fr.pins > 0);
         fr.pins -= 1;
@@ -170,7 +193,9 @@ const Pool = struct {
 
     /// Pins a page that an operation holds. It does no I/O, so it cannot fail.
     fn pinHeld(self: *Pool, pgno: u32) Page {
-        const p = self.heldPage(pgno);
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const p = self.findHeld(pgno);
         const fr = self.frameOf(p);
         fr.pins += 1;
         self.touch(fr);
@@ -179,20 +204,32 @@ const Pool = struct {
 
     /// Gives a page that an operation holds, without a change to its pins.
     fn heldPage(self: *Pool, pgno: u32) Page {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return self.findHeld(pgno);
+    }
+
+    fn findHeld(self: *Pool, pgno: u32) Page {
         const f = self.find(pgno) orelse @panic("page is not held");
         std.debug.assert(self.frames[f].pins > 0);
         return .{ .page = self.frameData(f) };
     }
 
     fn markDirty(self: *Pool, p: Page) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         self.frameOf(p).dirty = true;
     }
 
     fn pgnoOf(self: *Pool, p: Page) u32 {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         return self.frameOf(p).pgno.?;
     }
 
     fn flush(self: *Pool) !void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         for (&self.frames, 0..) |*fr, f| {
             if (fr.dirty) {
                 try self.write(fr.pgno.?, self.frameData(f));
@@ -201,7 +238,9 @@ const Pool = struct {
         }
     }
 
-    fn pinned(self: *const Pool) usize {
+    fn pinned(self: *Pool) usize {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
         var n: usize = 0;
         for (self.frames) |fr| n += fr.pins;
         return n;
@@ -242,7 +281,7 @@ pub const BPTree = struct {
     npages: u32 = 0,
     freelist: u32 = 0,
 
-    mu: Io.Mutex = .init,
+    tree_lock: Io.RwLock = .init,
 
     /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
     /// The caller owns `file` and must keep it open until `deinit`.
@@ -406,8 +445,8 @@ pub const BPTree = struct {
 
     pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
-        self.mu.lockUncancelable(self.pool.io);
-        defer self.mu.unlock(self.pool.io);
+        self.tree_lock.lockSharedUncancelable(self.pool.io);
+        defer self.tree_lock.unlockShared(self.pool.io);
         var op: Op = .{};
         const path = try self.descend(&op, key);
         defer self.releaseHeld(&op);
@@ -472,8 +511,8 @@ pub const BPTree = struct {
     pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
-        self.mu.lockUncancelable(self.pool.io);
-        defer self.mu.unlock(self.pool.io);
+        self.tree_lock.lockUncancelable(self.pool.io);
+        defer self.tree_lock.unlock(self.pool.io);
         var op: Op = .{};
         const path = try self.descend(&op, key);
         defer self.releaseHeld(&op);
@@ -577,8 +616,8 @@ pub const BPTree = struct {
 
     pub fn delete(self: *BPTree, key: []const u8) !bool {
         if (key.len > max_key) return error.KeyTooLarge;
-        self.mu.lockUncancelable(self.pool.io);
-        defer self.mu.unlock(self.pool.io);
+        self.tree_lock.lockUncancelable(self.pool.io);
+        defer self.tree_lock.unlock(self.pool.io);
         var op: Op = .{};
         const path = try self.descend(&op, key);
         defer self.releaseHeld(&op);
