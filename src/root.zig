@@ -131,6 +131,14 @@ const Pool = struct {
         }
     }
 
+    fn tryLatch(self: *Pool, p: Page, mode: Latch) bool {
+        const l = &self.latches[self.frameIndex(p)];
+        return switch (mode) {
+            .shared => l.tryLockShared(self.io),
+            .exclusive => l.tryLock(self.io),
+        };
+    }
+
     fn unlatch(self: *Pool, p: Page, mode: Latch) void {
         const l = &self.latches[self.frameIndex(p)];
         switch (mode) {
@@ -720,30 +728,48 @@ pub const BPTree = struct {
         ctx: anytype,
         comptime visit: fn (ctx: @TypeOf(ctx), key: []const u8, val: []const u8) anyerror!void,
     ) !usize {
-        var op: Op = .{};
-        const path = try self.descend(&op, lo orelse "", .shared);
-        defer self.releaseHeld(&op);
-        var leaf = path.leaf;
-        defer if (leaf.page != path.leaf.page) self.pool.unpin(leaf, .clean);
-
+        var start_buf: [max_key]u8 = undefined;
+        var start: []const u8 = lo orelse "";
+        var after: bool = false;
         var count: usize = 0;
-        var i = if (lo) |l| leaf.search(l).index else 0;
 
-        while (true) {
-            for (i..leaf.count()) |j| {
-                const k = leaf.cellKey(j);
-                if (hi) |h| if (std.mem.lessThan(u8, h, k)) return count;
+        restart: while (true) {
+            var op: Op = .{};
+            const path = try self.descend(&op, lo orelse "", .shared);
+            _ = op.held.pop();
+            self.releaseHeld(&op);
+            var leaf = path.leaf;
+            defer self.release(.{ .page = leaf, .mode = .shared });
 
-                try visit(ctx, k, leaf.leafVal(j));
-                count += 1;
+            const r = leaf.search(start);
+            var i = if (after and r.found) r.index + 1 else r.index;
+
+            while (true) {
+                const first = i;
+                for (i..leaf.count()) |j| {
+                    const k = leaf.cellKey(j);
+                    if (hi) |h| if (std.mem.lessThan(u8, h, k)) return count;
+                    try visit(ctx, k, leaf.leafVal(j));
+                    count += 1;
+                }
+                const next = leaf.link();
+                if (next == 0) return count;
+                const p = try self.getPage(next);
+                if (!self.pool.tryLatch(p, .shared)) {
+                    self.pool.unpin(p, .clean);
+                    if (leaf.count() > first) {
+                        const k = leaf.cellKey(leaf.count() - 1);
+                        @memcpy(start_buf[0..k.len], k);
+                        start = start_buf[0..k.len];
+                        after = true;
+                    }
+                    continue :restart;
+                }
+                self.release(.{ .page = leaf, .mode = .shared });
+                leaf = p;
+                if (leaf.kind() != .leaf) return error.BadFile;
+                i = 0;
             }
-            const next = leaf.link();
-            if (next == 0) return count;
-            const p = try self.getPage(next);
-            if (leaf.page != path.leaf.page) self.pool.unpin(leaf, .clean);
-            leaf = p;
-            if (leaf.kind() != .leaf) return error.BadFile;
-            i = 0;
         }
     }
 
