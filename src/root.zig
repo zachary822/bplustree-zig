@@ -90,6 +90,7 @@ const Pool = struct {
 
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
+    latches: [pool_frames]Io.RwLock = @splat(.init),
 
     const Load = enum { load, no_load };
     const Unpin = enum { clean, dirty };
@@ -114,8 +115,28 @@ const Pool = struct {
         return self.mem[page_size * f ..][0..page_size];
     }
 
+    fn frameIndex(self: *Pool, p: Page) usize {
+        return (@intFromPtr(p.page) - @intFromPtr(self.mem.ptr)) / page_size;
+    }
+
     fn frameOf(self: *Pool, p: Page) *Frame {
-        return &self.frames[(@intFromPtr(p.page) - @intFromPtr(self.mem.ptr)) / page_size];
+        return &self.frames[self.frameIndex(p)];
+    }
+
+    fn latch(self: *Pool, p: Page, mode: Latch) void {
+        const l = &self.latches[self.frameIndex(p)];
+        switch (mode) {
+            .shared => l.lockSharedUncancelable(self.io),
+            .exclusive => l.lockUncancelable(self.io),
+        }
+    }
+
+    fn unlatch(self: *Pool, p: Page, mode: Latch) void {
+        const l = &self.latches[self.frameIndex(p)];
+        switch (mode) {
+            .shared => l.unlockShared(self.io),
+            .exclusive => l.unlock(self.io),
+        }
     }
 
     fn find(self: *Pool, pgno: u32) ?usize {
@@ -269,8 +290,17 @@ const Path = struct {
     }
 };
 
+const Latch = enum { shared, exclusive };
+
+const Held = struct {
+    page: Page,
+    mode: Latch,
+};
+
 const Op = struct {
-    held: Stack(Page, 2 * max_depth) = .{},
+    held: Stack(Held, 2 * max_depth) = .{},
+    top: usize = 0,
+    root_latch: ?Latch = null,
     spare: Stack(Page, max_depth + 2) = .{},
     scratch: CellList = .{},
 };
@@ -281,7 +311,8 @@ pub const BPTree = struct {
     npages: u32 = 0,
     freelist: u32 = 0,
 
-    tree_lock: Io.RwLock = .init,
+    root_latch: Io.RwLock = .init,
+    alloc_mu: Io.Mutex = .init,
 
     /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
     /// The caller owns `file` and must keep it open until `deinit`.
@@ -336,11 +367,13 @@ pub const BPTree = struct {
 
     /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
     fn getPage(self: *BPTree, pgno: u32) !Page {
-        if (pgno == meta_pgno or pgno >= self.npages) return error.BadFile;
+        if (pgno == meta_pgno or pgno >= @atomicLoad(u32, &self.npages, .monotonic)) return error.BadFile;
         return self.pool.pin(pgno, .load);
     }
 
     fn pageAlloc(self: *BPTree, t: Page.Type) !Page {
+        self.alloc_mu.lockUncancelable(self.pool.io);
+        defer self.alloc_mu.unlock(self.pool.io);
         if (self.freelist != 0) {
             const p = try self.getPage(self.freelist);
             if (p.kind() != .free) {
@@ -352,23 +385,56 @@ pub const BPTree = struct {
             return p;
         }
         const pgno = self.npages;
-        self.npages += 1;
-        errdefer self.npages -= 1;
         const p = try self.pool.pin(pgno, .no_load);
+        @atomicStore(u32, &self.npages, pgno + 1, .monotonic);
         p.init(t);
         return p;
     }
 
     fn pageFree(self: *BPTree, p: Page) void {
         const pgno = self.pool.pgnoOf(p);
+        self.alloc_mu.lockUncancelable(self.pool.io);
         p.init(.free);
         p.setLink(self.freelist);
         self.freelist = pgno;
+        self.alloc_mu.unlock(self.pool.io);
         self.pool.unpin(p, .dirty);
     }
 
+    fn lockRoot(self: *BPTree, op: *Op, mode: Latch) void {
+        switch (mode) {
+            .shared => self.root_latch.lockSharedUncancelable(self.pool.io),
+            .exclusive => self.root_latch.lockUncancelable(self.pool.io),
+        }
+        op.root_latch = mode;
+    }
+
+    fn unlockRoot(self: *BPTree, op: *Op) void {
+        const mode = op.root_latch orelse return;
+        switch (mode) {
+            .shared => self.root_latch.unlockShared(self.pool.io),
+            .exclusive => self.root_latch.unlock(self.pool.io),
+        }
+        op.root_latch = null;
+    }
+
+    fn release(self: *BPTree, h: Held) void {
+        self.pool.unlatch(h.page, h.mode);
+        self.pool.unpin(h.page, .clean);
+    }
+
+    fn releaseAbove(self: *BPTree, op: *Op) void {
+        self.unlockRoot(op);
+        const last = op.held.len - 1;
+        for (op.held.items()[op.top..last]) |h| self.release(h);
+        op.top = last;
+    }
+
     fn releaseHeld(self: *BPTree, op: *Op) void {
-        while (op.held.pop()) |p| self.pool.unpin(p, .clean);
+        self.unlockRoot(op);
+        while (op.held.len > op.top) self.release(op.held.pop().?);
+        op.held.len = 0;
+        op.top = 0;
     }
 
     /// Allocates `n` pages before an operation changes the tree. `takeSpare` then gives them out without I/O.
@@ -406,10 +472,12 @@ pub const BPTree = struct {
         var spares: usize = 0;
         var k = d;
         while (k > 0) : (k -= 1) {
+            std.debug.assert(k - 1 >= op.top);
             const parent = self.pool.heldPage(path[k - 1].pgno);
             const idx = path[k - 1].idx;
             const sib = try self.getPage(parent.child(if (idx > 0) idx - 1 else idx + 1));
-            op.held.push(sib);
+            self.pool.latch(sib, .exclusive);
+            op.held.push(.{ .page = sib, .mode = .exclusive });
             if (sib.kind() != self.pool.heldPage(path[k].pgno).kind()) return error.BadFile;
             spares = @max(spares, self.splitPages(path, k - 1, parent.freeBytes() < max_sep));
             // A merge or a redistribution at level k removes at most one separator from the parent.
@@ -419,15 +487,19 @@ pub const BPTree = struct {
     }
 
     /// Holds the path from the root to the leaf for `key` until `releaseHeld`.
-    fn descend(self: *BPTree, op: *Op, key: []const u8) !Path {
+    fn descend(self: *BPTree, op: *Op, key: []const u8, mode: Latch) !Path {
         errdefer self.releaseHeld(op);
+        self.lockRoot(op, mode);
         var path: Path = .{};
         var pgno = self.root;
         while (true) {
             const p = try self.getPage(pgno);
-            op.held.push(p);
+            self.pool.latch(p, mode);
+            op.held.push(.{ .page = p, .mode = mode });
             const e = &path.entries[path.depth];
             e.pgno = pgno;
+            if (mode == .shared or p.kind() == .internal and isSafe(p, path.depth == 0))
+                self.releaseAbove(op);
             switch (p.kind()) {
                 .leaf => {
                     path.leaf = p;
@@ -445,10 +517,8 @@ pub const BPTree = struct {
 
     pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
-        self.tree_lock.lockSharedUncancelable(self.pool.io);
-        defer self.tree_lock.unlockShared(self.pool.io);
         var op: Op = .{};
-        const path = try self.descend(&op, key);
+        const path = try self.descend(&op, key, .shared);
         defer self.releaseHeld(&op);
         const leaf = path.leaf;
         const r = leaf.search(key);
@@ -463,6 +533,7 @@ pub const BPTree = struct {
 
     /// true if split. The caller holds the path and reserves the new pages.
     fn insertUp(self: *BPTree, op: *Op, path: []const PathEntry, d: usize, idx: usize, c: []const u8) bool {
+        std.debug.assert(d >= op.top);
         const pgno = path[d].pgno;
         const p = self.pool.pinHeld(pgno);
         if (p.insertCell(idx, c)) {
@@ -511,10 +582,8 @@ pub const BPTree = struct {
     pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
-        self.tree_lock.lockUncancelable(self.pool.io);
-        defer self.tree_lock.unlock(self.pool.io);
         var op: Op = .{};
-        const path = try self.descend(&op, key);
+        const path = try self.descend(&op, key, .exclusive);
         defer self.releaseHeld(&op);
         const leaf = path.leaf;
         defer self.releaseSpares(&op);
@@ -523,8 +592,10 @@ pub const BPTree = struct {
         const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
         const new_sz = 4 + key.len + val.len + 2;
         const splits = leaf.freeBytes() + old_sz < new_sz;
+        const underflows = r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill;
+        if (!splits and !underflows) self.releaseAbove(&op);
         var spares = self.splitPages(path.slice(), path.depth, splits);
-        if (r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill)
+        if (underflows)
             spares = @max(spares, try self.holdSiblings(&op, path.slice(), path.depth));
         try self.reserve(&op, spares);
 
@@ -542,10 +613,12 @@ pub const BPTree = struct {
 
     /// The caller holds the path and the siblings, and reserves the new pages.
     fn rebalance(self: *BPTree, op: *Op, path: []const PathEntry, d: usize) void {
+        std.debug.assert(d >= op.top);
         const p = self.pool.pinHeld(path[d].pgno);
 
         if (d == 0) {
             if (p.kind() == .internal and p.count() == 0) {
+                std.debug.assert(op.root_latch == .exclusive);
                 self.root = p.link();
                 self.pageFree(p);
             } else {
@@ -616,10 +689,8 @@ pub const BPTree = struct {
 
     pub fn delete(self: *BPTree, key: []const u8) !bool {
         if (key.len > max_key) return error.KeyTooLarge;
-        self.tree_lock.lockUncancelable(self.pool.io);
-        defer self.tree_lock.unlock(self.pool.io);
         var op: Op = .{};
-        const path = try self.descend(&op, key);
+        const path = try self.descend(&op, key, .exclusive);
         defer self.releaseHeld(&op);
         const leaf = path.leaf;
         defer self.releaseSpares(&op);
@@ -627,8 +698,11 @@ pub const BPTree = struct {
         const r = leaf.search(key);
         if (!r.found) return false;
         const old_sz = leaf.cell(r.index).len + 2;
-        if (leaf.usedBytes() - old_sz < min_fill)
+        if (leaf.usedBytes() - old_sz < min_fill) {
             try self.reserve(&op, try self.holdSiblings(&op, path.slice(), path.depth));
+        } else {
+            self.releaseAbove(&op);
+        }
 
         // Nothing below can fail, so the tree changes completely or not at all.
         leaf.deleteCell(r.index);
@@ -646,10 +720,8 @@ pub const BPTree = struct {
         ctx: anytype,
         comptime visit: fn (ctx: @TypeOf(ctx), key: []const u8, val: []const u8) anyerror!void,
     ) !usize {
-        self.tree_lock.lockSharedUncancelable(self.pool.io);
-        defer self.tree_lock.unlockShared(self.pool.io);
         var op: Op = .{};
-        const path = try self.descend(&op, lo orelse "");
+        const path = try self.descend(&op, lo orelse "", .shared);
         defer self.releaseHeld(&op);
         var leaf = path.leaf;
         defer if (leaf.page != path.leaf.page) self.pool.unpin(leaf, .clean);
@@ -745,6 +817,11 @@ pub const BPTree = struct {
 fn checkFail(comptime fmt: []const u8, args: anytype) error{CheckFailed} {
     std.log.err("check: " ++ fmt, args);
     return error.CheckFailed;
+}
+
+fn isSafe(p: Page, is_root: bool) bool {
+    if (p.freeBytes() < max_sep) return false;
+    return if (is_root) p.count() >= 2 else p.usedBytes() >= min_fill + max_sep;
 }
 
 const Page = struct {
@@ -1177,7 +1254,7 @@ test "BPTree get" {
     try std.testing.expectError(error.KeyTooLarge, t.get(&long_key, &buf));
 
     var op: Op = .{};
-    const path = try t.descend(&op, "z");
+    const path = try t.descend(&op, "z", .exclusive);
     defer t.releaseHeld(&op);
     try std.testing.expectEqual(1, path.depth);
     try std.testing.expectEqual(t.root, path.entries[0].pgno);
@@ -1376,7 +1453,7 @@ test "BPTree failed operation does not change the tree" {
     const Pinner = struct {
         fn pinAllBut(tree: *BPTree, key: []const u8, pinned: *[pool_frames]Page) !usize {
             var op: Op = .{};
-            const path = try tree.descend(&op, key);
+            const path = try tree.descend(&op, key, .exclusive);
             defer tree.releaseHeld(&op);
             const p = path.slice();
             var skip: Stack(u32, 2 * max_depth) = .{};
