@@ -220,6 +220,32 @@ fn watchdog(io: Io, done: *std.atomic.Value(bool)) void {
     }
 }
 
+/// A tree's file and its log, which is the same path with `.wal` added.
+const Files = struct {
+    file: Io.File,
+    log: Io.File,
+
+    fn open(io: Io, path: []const u8, truncate: bool) !Files {
+        var buf: [256]u8 = undefined;
+        const log_path = try std.fmt.bufPrint(&buf, "{s}.wal", .{path});
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = truncate });
+        errdefer file.close(io);
+        const log = try Io.Dir.cwd().createFile(io, log_path, .{ .read = true, .truncate = truncate });
+        return .{ .file = file, .log = log };
+    }
+
+    fn close(f: Files, io: Io) void {
+        f.file.close(io);
+        f.log.close(io);
+    }
+
+    fn delete(io: Io, path: []const u8) void {
+        var buf: [256]u8 = undefined;
+        Io.Dir.cwd().deleteFile(io, path) catch {};
+        Io.Dir.cwd().deleteFile(io, std.fmt.bufPrint(&buf, "{s}.wal", .{path}) catch return) catch {};
+    }
+};
+
 /// Writes to keys `k % crash_threads == id` until the process ends.
 fn crashWorker(t: *bpt.BPTree, id: usize, seed: u64) void {
     var prng: std.Random.DefaultPrng = .init(seed);
@@ -241,8 +267,8 @@ const crash_threads = 4;
 /// Fills a new tree in `path`, syncs it, and then writes from `crash_threads` threads
 /// until the process ends after `ms` milliseconds, in the middle of their operations.
 fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
-    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
-    var t: bpt.BPTree = try .init(gpa, io, file);
+    const f: Files = try .open(io, path, true);
+    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
     var kbuf: [16]u8 = undefined;
     var vbuf: [bpt.max_val]u8 = undefined;
     for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
@@ -255,9 +281,9 @@ fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !
 
 /// Opens the tree in `path` and checks it: the tree must be whole, and every value must be a whole value of its key.
 fn verify(io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
-    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
-    defer file.close(io);
-    var t: bpt.BPTree = try .init(gpa, io, file);
+    const f: Files = try .open(io, path, false);
+    defer f.close(io);
+    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
     defer t.deinit(gpa);
     try t.check(gpa);
     const V = struct {
@@ -287,12 +313,12 @@ pub fn main(init: std.process.Init) !void {
     io.random(&rnd);
     var name_buf: [32]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "stress-{x}.bin", .{std.mem.readInt(u32, &rnd, .little)});
-    const file = try Io.Dir.cwd().createFile(io, name, .{ .read = true, .truncate = true });
+    const f: Files = try .open(io, name, true);
     defer {
-        file.close(io);
-        Io.Dir.cwd().deleteFile(io, name) catch {};
+        f.close(io);
+        Files.delete(io, name);
     }
-    var t: bpt.BPTree = try .init(gpa, io, file);
+    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
     defer t.deinit(gpa);
 
     var done: std.atomic.Value(bool) = .init(false);

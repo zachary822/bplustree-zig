@@ -78,10 +78,80 @@ const Frame = struct {
     last_used: u64 = 0,
 };
 
+const Wal = struct {
+    file: Io.File,
+    mu: Io.Mutex = .init,
+    end: std.atomic.Value(u64) = .init(0),
+    epoch: u32 = 0,
+
+    const rec_hdr = 16;
+
+    const Kind = enum(u8) {
+        page = 1,
+        commit = 2,
+        _,
+    };
+
+    const Record = struct {
+        kind: Kind,
+        arg: u32,
+        end: u64,
+    };
+
+    fn header(buf: *[rec_hdr]u8, epoch: u32, kind: Kind, arg: u32) void {
+        put32(buf[4..], epoch);
+        buf[8] = @backingInt(kind);
+        @memset(buf[9..12], 0);
+        put32(buf[12..], arg);
+    }
+
+    fn crc(rec: []const u8) u32 {
+        return std.hash.Crc32.hash(rec[4..]);
+    }
+
+    fn append(self: *Wal, io: Io, pages: []const Page, pgnos: []const u32, root: u32) !u64 {
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        var off = self.end.raw;
+        var rec: [rec_hdr + page_size]u8 = undefined;
+        for (pages, pgnos) |p, pgno| {
+            header(rec[0..rec_hdr], self.epoch, .page, pgno);
+            @memcpy(rec[rec_hdr..], p.page);
+            put32(&rec, crc(&rec));
+            try self.file.writePositionalAll(io, &rec, off);
+            off += rec.len;
+        }
+        header(rec[0..rec_hdr], self.epoch, .commit, root);
+        put32(&rec, crc(rec[0..rec_hdr]));
+        try self.file.writePositionalAll(io, rec[0..rec_hdr], off);
+        off += rec_hdr;
+        self.end.store(off, .release);
+        return off;
+    }
+
+    fn next(self: *Wal, io: Io, off: u64, buf: *[page_size]u8) !?Record {
+        var rec: [rec_hdr + page_size]u8 = undefined;
+        if (try self.file.readPositionalAll(io, rec[0..rec_hdr], off) < rec_hdr) return null;
+        if (get32(rec[4..]) != self.epoch) return null;
+        const kind: Kind = @fromBackingInt(rec[8]);
+        const len: usize = switch (kind) {
+            .page => rec_hdr + page_size,
+            .commit => rec_hdr,
+            _ => return null,
+        };
+        if (len > rec_hdr and try self.file.readPositionalAll(io, rec[rec_hdr..len], off + rec_hdr) < len - rec_hdr)
+            return null;
+        if (get32(&rec) != crc(rec[0..len])) return null;
+        if (kind == .page) @memcpy(buf, rec[rec_hdr..]);
+        return .{ .kind = kind, .arg = get32(rec[12..]), .end = off + len };
+    }
+};
+
 /// The buffer pool: a fixed set of frames that keep pages of the file in memory.
 const Pool = struct {
     io: Io,
     file: Io.File,
+    wal: Wal,
     frames: [pool_frames]Frame = @splat(.{}),
     mem: []u8,
     tick: u64 = 0,
@@ -258,10 +328,12 @@ const Pool = struct {
         return .{ .page = self.frameData(f) };
     }
 
-    fn markDirty(self: *Pool, p: Page) void {
+    fn pinAgain(self: *Pool, p: Page) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        self.frameOf(p).dirty = true;
+        const fr = self.frameOf(p);
+        std.debug.assert(fr.pins > 0);
+        fr.pins += 1;
     }
 
     fn pgnoOf(self: *Pool, p: Page) u32 {
@@ -325,12 +397,17 @@ const Descent = enum {
     write,
 };
 
+const max_changed = 3 * max_depth + 2;
+
 const Op = struct {
     held: Stack(Held, 2 * max_depth) = .{},
     top: usize = 0,
     root_latch: ?Latch = null,
     spare: Stack(Page, max_depth + 2) = .{},
     scratch: CellList = .{},
+    changed: Stack(Page, max_changed) = .{},
+    freed: Stack(Page, max_changed) = .{},
+    lsn: u64 = 0,
 };
 
 pub const BPTree = struct {
@@ -344,10 +421,10 @@ pub const BPTree = struct {
 
     /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
     /// The caller owns `file` and must keep it open until `deinit`.
-    pub fn init(gpa: Allocator, io: Io, file: Io.File) !BPTree {
+    pub fn init(gpa: Allocator, io: Io, file: Io.File, log: Io.File) !BPTree {
         const mem = try gpa.alloc(u8, page_size * pool_frames);
         errdefer gpa.free(mem);
-        var t: BPTree = .{ .pool = .{ .io = io, .file = file, .mem = mem } };
+        var t: BPTree = .{ .pool = .{ .io = io, .file = file, .wal = .{ .file = log }, .mem = mem } };
 
         if (try file.length(io) == 0) {
             t.npages = 1;
@@ -399,7 +476,7 @@ pub const BPTree = struct {
         return self.pool.pin(pgno, .load);
     }
 
-    fn pageAlloc(self: *BPTree, t: Page.Type) !Page {
+    fn pageAlloc(self: *BPTree, t: Page.Kind) !Page {
         self.alloc_mu.lockUncancelable(self.pool.io);
         defer self.alloc_mu.unlock(self.pool.io);
         if (self.freelist != 0) {
@@ -419,14 +496,36 @@ pub const BPTree = struct {
         return p;
     }
 
-    fn pageFree(self: *BPTree, p: Page) void {
-        const pgno = self.pool.pgnoOf(p);
-        self.alloc_mu.lockUncancelable(self.pool.io);
+    fn pageFree(self: *BPTree, op: *Op, p: Page) void {
+        _ = self;
         p.init(.free);
-        p.setLink(self.freelist);
-        self.freelist = pgno;
-        self.alloc_mu.unlock(self.pool.io);
-        self.pool.unpin(p, .dirty);
+        op.freed.push(p);
+    }
+
+    fn changed(self: *BPTree, op: *Op, p: Page) void {
+        for (op.changed.items()) |c| if (c.page == p.page) return;
+        self.pool.pinAgain(p);
+        op.changed.push(p);
+    }
+
+    fn commit(self: *BPTree, op: *Op) void {
+        if (op.changed.len > 0) {
+            var pgnos: [max_changed]u32 = undefined;
+            for (op.changed.items(), 0..) |p, i| pgnos[i] = self.pool.pgnoOf(p);
+            const root = if (op.root_latch == .exclusive) self.root else 0;
+            op.lsn = self.pool.wal.append(self.pool.io, op.changed.items(), pgnos[0..op.changed.len], root) catch |err|
+                std.debug.panic("commit: cannot write the log: {t}", .{err});
+            while (op.changed.pop()) |p| self.pool.unpin(p, .dirty);
+        }
+        if (op.freed.len > 0) {
+            self.alloc_mu.lockUncancelable(self.pool.io);
+            for (op.freed.items()) |p| {
+                p.setLink(self.freelist);
+                self.freelist = self.pool.pgnoOf(p);
+            }
+            self.alloc_mu.unlock(self.pool.io);
+            while (op.freed.pop()) |p| self.pool.unpin(p, .dirty);
+        }
     }
 
     fn lockRoot(self: *BPTree, op: *Op, mode: Latch) void {
@@ -470,7 +569,7 @@ pub const BPTree = struct {
         for (0..n) |_| op.spare.push(try self.pageAlloc(.free));
     }
 
-    fn takeSpare(op: *Op, t: Page.Type) Page {
+    fn takeSpare(op: *Op, t: Page.Kind) Page {
         const p = op.spare.pop().?;
         p.init(t);
         return p;
@@ -478,7 +577,7 @@ pub const BPTree = struct {
 
     /// Frees the spare pages that the operation did not use. The reverse order puts the freelist back as it was.
     fn releaseSpares(self: *BPTree, op: *Op) void {
-        while (op.spare.pop()) |p| self.pageFree(p);
+        while (op.spare.pop()) |p| self.pageFree(op, p);
     }
 
     /// The maximum number of new pages that a chain of splits needs when level `d` gets a cell.
@@ -571,6 +670,7 @@ pub const BPTree = struct {
         const pgno = path[d].pgno;
         const p = self.pool.pinHeld(pgno);
         if (p.insertCell(idx, c)) {
+            self.changed(op, p);
             self.pool.unpin(p, .dirty);
             return false;
         }
@@ -598,6 +698,8 @@ pub const BPTree = struct {
             p.fill(.internal, p.link(), cl, 0, s);
             break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
         };
+        self.changed(op, right);
+        self.changed(op, p);
         self.pool.unpin(right, .dirty);
         self.pool.unpin(p, .dirty);
 
@@ -607,6 +709,7 @@ pub const BPTree = struct {
             root.setLink(pgno);
             _ = root.insertCell(0, sep);
             self.root = self.pool.pgnoOf(root);
+            self.changed(op, root);
             self.pool.unpin(root, .dirty);
         } else {
             _ = self.insertUp(op, path, d - 1, path[d - 1].idx, sep);
@@ -617,6 +720,7 @@ pub const BPTree = struct {
     fn putIn(self: *BPTree, op: *Op, key: []const u8, val: []const u8, how: Descent) !bool {
         const path = try self.descend(op, key, how);
         defer self.releaseHeld(op);
+        defer self.commit(op);
         const leaf = path.leaf;
         defer self.releaseSpares(op);
 
@@ -638,7 +742,7 @@ pub const BPTree = struct {
         // Nothing below can fail, so the tree changes completely or not at all.
         if (r.found) {
             leaf.deleteCell(r.index);
-            self.pool.markDirty(leaf);
+            self.changed(op, leaf);
         }
         var c: [4 + max_key + max_val]u8 = undefined;
         const split = self.insertUp(op, path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
@@ -665,7 +769,7 @@ pub const BPTree = struct {
             if (p.kind() == .internal and p.count() == 0) {
                 std.debug.assert(op.root_latch == .exclusive);
                 self.root = p.link();
-                self.pageFree(p);
+                self.pageFree(op, p);
             } else {
                 self.pool.unpin(p, .clean);
             }
@@ -700,9 +804,11 @@ pub const BPTree = struct {
         if (cl.bytes(0, cl.cells.len) <= capacity) {
             const link = if (leaf) right.link() else left.link();
             left.fill(left.kind(), link, cl, 0, cl.cells.len);
-            self.pageFree(right);
+            self.pageFree(op, right);
+            self.changed(op, left);
             self.pool.unpin(left, .dirty);
             parent.deleteCell(sep_idx);
+            self.changed(op, parent);
             self.pool.unpin(parent, .dirty);
             self.rebalance(op, path, d - 1);
             return;
@@ -722,9 +828,12 @@ pub const BPTree = struct {
             right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
             break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
         };
+        self.changed(op, left);
+        self.changed(op, right);
         self.pool.unpin(left, .dirty);
         self.pool.unpin(right, .dirty);
         parent.deleteCell(sep_idx);
+        self.changed(op, parent);
         self.pool.unpin(parent, .dirty);
 
         if (!self.insertUp(op, path, d - 1, sep_idx, sep)) {
@@ -735,6 +844,7 @@ pub const BPTree = struct {
     fn deleteIn(self: *BPTree, op: *Op, key: []const u8, how: Descent) !?bool {
         const path = try self.descend(op, key, how);
         defer self.releaseHeld(op);
+        defer self.commit(op);
         const leaf = path.leaf;
         defer self.releaseSpares(op);
 
@@ -750,7 +860,7 @@ pub const BPTree = struct {
 
         // Nothing below can fail, so the tree changes completely or not at all.
         leaf.deleteCell(r.index);
-        self.pool.markDirty(leaf);
+        self.changed(op, leaf);
         self.rebalance(op, path.slice(), path.depth);
         return true;
     }
@@ -897,20 +1007,20 @@ const Page = struct {
     page: *[page_size]u8,
 
     /// Non-exhaustive, because a corrupt file can contain any byte.
-    const Type = enum(u8) {
+    const Kind = enum(u8) {
         free = 0,
         leaf = 1,
         internal = 2,
         _,
     };
 
-    fn init(self: Page, t: Type) void {
+    fn init(self: Page, t: Kind) void {
         @memset(self.page, 0);
         self.page[0] = @backingInt(t);
         self.setCellStart(page_size);
     }
 
-    fn kind(self: Page) Type {
+    fn kind(self: Page) Kind {
         return @fromBackingInt(self.page[0]);
     }
 
@@ -1053,7 +1163,7 @@ const Page = struct {
         return if (e.found) e.index + 1 else e.index;
     }
 
-    fn fill(self: Page, t: Type, link_pgno: u32, cl: *const CellList, from: usize, to: usize) void {
+    fn fill(self: Page, t: Kind, link_pgno: u32, cl: *const CellList, from: usize, to: usize) void {
         self.init(t);
         self.setLink(link_pgno);
         for (cl.cells.items()[from..to], 0..) |c, i| {
@@ -1131,12 +1241,18 @@ fn createTestFile(dir: Io.Dir) !Io.File {
     return dir.createFile(std.testing.io, "test.bin", .{ .read = true });
 }
 
+fn createTestLog(dir: Io.Dir) !Io.File {
+    return dir.createFile(std.testing.io, "test.bin.wal", .{ .read = true });
+}
+
 test BPTree {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     try t.metaWrite();
@@ -1152,14 +1268,16 @@ test "BPTree sync and reopen" {
     const N = 500;
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
     {
-        var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+        var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
         defer t.deinit(std.testing.allocator);
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         try t.sync();
     }
     // A new tree has an empty pool, so it reads all pages from the file.
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
     for (0..N) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
@@ -1174,8 +1292,51 @@ test "BPTree bad file" {
 
     const file = try createTestFile(tmp.dir);
     defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
     try file.writePositionalAll(io, "garbage!", 0);
-    try std.testing.expectError(error.BadFile, BPTree.init(std.testing.allocator, io, file));
+    try std.testing.expectError(error.BadFile, BPTree.init(std.testing.allocator, io, file, log));
+}
+
+test Wal {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+    var w: Wal = .{ .file = log, .epoch = 7 };
+
+    var a: [page_size]u8 = @splat('a');
+    var b: [page_size]u8 = @splat('b');
+    const pa: Page = .{ .page = &a };
+    const pb: Page = .{ .page = &b };
+    const first = try w.append(io, &.{ pa, pb }, &.{ 3, 4 }, 0);
+    const second = try w.append(io, &.{pa}, &.{5}, 9);
+    try std.testing.expectEqual(3 * Wal.rec_hdr + 2 * page_size, first);
+    try std.testing.expectEqual(second, w.end.raw);
+
+    // Read it all back: page 3, page 4, commit, page 5, commit with root 9, and then the end.
+    var buf: [page_size]u8 = undefined;
+    var off: u64 = 0;
+    const want = [_]struct { Wal.Kind, u32, u8 }{ .{ .page, 3, 'a' }, .{ .page, 4, 'b' }, .{ .commit, 0, 0 }, .{ .page, 5, 'a' }, .{ .commit, 9, 0 } };
+    for (want) |wnt| {
+        const r = (try w.next(io, off, &buf)).?;
+        try std.testing.expectEqual(wnt[0], r.kind);
+        try std.testing.expectEqual(wnt[1], r.arg);
+        if (r.kind == .page) try std.testing.expectEqual(wnt[2], buf[100]);
+        off = r.end;
+    }
+    try std.testing.expectEqual(second, off);
+    try std.testing.expectEqual(null, try w.next(io, off, &buf));
+
+    // A torn record ends the log there.
+    try log.writePositionalAll(io, "x", first + Wal.rec_hdr + 100);
+    try std.testing.expectEqual(null, try w.next(io, first, &buf));
+    try std.testing.expect(try w.next(io, 0, &buf) != null);
+
+    // So does a record from another epoch.
+    w.epoch = 8;
+    try std.testing.expectEqual(null, try w.next(io, 0, &buf));
 }
 
 test Page {
@@ -1236,7 +1397,9 @@ test Pool {
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     t.npages = pool_frames + 4;
@@ -1260,7 +1423,9 @@ test "BPTree page alloc" {
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     // open allocates the root leaf as page 1.
@@ -1273,7 +1438,10 @@ test "BPTree page alloc" {
     try std.testing.expectEqual(.leaf, a.kind());
     try std.testing.expectEqual(3, t.npages);
 
-    t.pageFree(a);
+    var op: Op = .{};
+    t.pageFree(&op, a);
+    try std.testing.expectEqual(0, t.freelist);
+    t.commit(&op);
     try std.testing.expectEqual(a_pgno, t.freelist);
 
     const b = try t.pageAlloc(.internal);
@@ -1290,7 +1458,9 @@ test "BPTree get" {
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     // Make a two-level tree by hand: the root holds "m", with "a" on the left and "m", "z" on the right.
@@ -1377,7 +1547,9 @@ test "BPTree put get delete" {
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     const N = 2000;
@@ -1443,7 +1615,9 @@ test "BPTree scan" {
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     // Only the odd numbers, so that a bound can fall between two keys.
@@ -1507,7 +1681,9 @@ test "BPTree failed operation does not change the tree" {
     defer tmp.cleanup();
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
     var kbuf: [16]u8 = undefined;
