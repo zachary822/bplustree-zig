@@ -220,6 +220,55 @@ fn watchdog(io: Io, done: *std.atomic.Value(bool)) void {
     }
 }
 
+/// Writes to keys `k % crash_threads == id` until the process ends.
+fn crashWorker(t: *bpt.BPTree, id: usize, seed: u64) void {
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const rand = prng.random();
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [bpt.max_val]u8 = undefined;
+    while (true) {
+        const k = id + crash_threads * rand.uintLessThan(usize, test_keys / crash_threads);
+        const key = keyOf(&kbuf, k);
+        const r = if (rand.uintLessThan(usize, 10) < 7)
+            t.put(key, makeVal(&vbuf, k, rand.int(u32) | 1))
+        else if (t.delete(key)) |_| {} else |err| err;
+        r catch |err| if (err != error.PoolExhausted) std.debug.panic("crash: {t}", .{err});
+    }
+}
+
+const crash_threads = 4;
+
+/// Fills a new tree in `path`, syncs it, and then writes from `crash_threads` threads
+/// until the process ends after `ms` milliseconds, in the middle of their operations.
+fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    var t: bpt.BPTree = try .init(gpa, io, file);
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [bpt.max_val]u8 = undefined;
+    for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
+    try t.sync();
+    for (0..crash_threads) |id| _ = try std.Thread.spawn(.{}, crashWorker, .{ &t, id, seed + id });
+    try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
+    // Like a crash of the process: no sync, no deinit, and the threads stop wherever they are.
+    std.process.exit(0);
+}
+
+/// Opens the tree in `path` and checks it: the tree must be whole, and every value must be a whole value of its key.
+fn verify(io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    var t: bpt.BPTree = try .init(gpa, io, file);
+    defer t.deinit(gpa);
+    try t.check(gpa);
+    const V = struct {
+        fn visit(_: void, key: []const u8, val: []const u8) !void {
+            const k = keyNum(key) orelse return error.BadKey;
+            if (valVersion(val, k) == null) return error.BadValue;
+        }
+    };
+    const n = try t.scan(null, null, {}, V.visit);
+    std.debug.print("verify: ok, {d} keys\n", .{n});
+}
 fn arg(args: []const [:0]const u8, i: usize, default: usize) !usize {
     return if (args.len > i) try std.fmt.parseInt(usize, args[i], 10) else default;
 }
@@ -229,6 +278,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const mode = if (args.len > 1) args[1] else "test";
+
+    if (std.mem.eql(u8, mode, "crash") and args.len > 4)
+        return crash(io, gpa, args[2], try arg(args, 3, 1), try arg(args, 4, 100));
+    if (std.mem.eql(u8, mode, "verify") and args.len > 2) return verify(io, gpa, args[2]);
 
     var rnd: [4]u8 = undefined;
     io.random(&rnd);
@@ -295,7 +348,8 @@ pub fn main(init: std.process.Init) !void {
             sh.threads, sh.read_pct, total, ns / std.time.ns_per_ms, total * std.time.ns_per_s / ns, sh.retries.raw,
         });
     } else {
-        std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]\n", .{});
+        std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
+            " | stress crash <file> <seed> <ms> | stress verify <file>\n", .{});
         return error.BadArgs;
     }
 }
