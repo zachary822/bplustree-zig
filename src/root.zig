@@ -165,12 +165,21 @@ const Pool = struct {
         var best: ?usize = null;
         for (&self.frames, 0..) |*fr, f| {
             if (fr.pgno == null) return f;
-            if (fr.pins == 0 and (best == null or fr.last_used < self.frames[best.?].last_used))
+            if (fr.pins == 0 and !fr.busy and (best == null or fr.last_used < self.frames[best.?].last_used))
                 best = f;
         }
         const f = best orelse return error.PoolExhausted;
         const fr = &self.frames[f];
-        if (fr.dirty) try self.write(fr.pgno.?, self.frameData(f));
+        if (fr.dirty) {
+            const pgno = fr.pgno.?;
+            fr.busy = true;
+            self.mu.unlock(self.io);
+            const result = self.write(pgno, self.frameData(f));
+            self.mu.lockUncancelable(self.io);
+            fr.busy = false;
+            self.cond.broadcast(self.io);
+            try result;
+        }
         fr.* = .{};
         return f;
     }
@@ -179,17 +188,20 @@ const Pool = struct {
         std.debug.assert(pgno != meta_pgno);
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        while (self.find(pgno)) |f| {
-            const fr = &self.frames[f];
-            if (fr.busy) {
-                self.cond.waitUncancelable(self.io, &self.mu);
-                continue;
+        const f = while (true) {
+            if (self.find(pgno)) |i| {
+                const fr = &self.frames[i];
+                if (fr.busy) {
+                    self.cond.waitUncancelable(self.io, &self.mu);
+                    continue;
+                }
+                fr.pins += 1;
+                self.touch(fr);
+                return .{ .page = self.frameData(i) };
             }
-            fr.pins += 1;
-            self.touch(fr);
-            return .{ .page = self.frameData(f) };
-        }
-        const f = try self.victim();
+            const v = try self.victim();
+            if (self.find(pgno) == null) break v;
+        };
         const fr = &self.frames[f];
         fr.* = .{ .pgno = pgno, .pins = 1, .busy = mode == .load };
         self.touch(fr);
