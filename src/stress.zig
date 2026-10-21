@@ -373,13 +373,14 @@ pub fn main(init: std.process.Init) !void {
         t.durable = args.len <= 5 or !std.mem.eql(u8, args[5], "nosync");
 
         const syncs = t.pool.wal.syncs.raw;
+        const locks = t.pool.locks;
         const start = Io.Clock.Timestamp.now(io, .awake);
         try run(benchWorker, &sh, 7);
         const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
         const total = sh.threads * sh.ops;
-        std.debug.print("threads={d} reads={d}% ops={d} time_ms={d} ops_per_s={d} retries={d} log_syncs={d}\n", .{
+        std.debug.print("threads={d} reads={d}% ops={d} time_ms={d} ops_per_s={d} retries={d} log_syncs={d} pool_locks_per_op={d:.2}\n", .{
             sh.threads,                     sh.read_pct,    total,                        ns / std.time.ns_per_ms,
-            total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs,
+            total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs, @as(f64, @floatFromInt(t.pool.locks - locks)) / @as(f64, @floatFromInt(total)),
         });
     } else {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
