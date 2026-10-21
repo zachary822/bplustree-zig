@@ -363,30 +363,6 @@ const Pool = struct {
         }
     }
 
-    /// Pins a page that an operation holds. It does no I/O, so it cannot fail.
-    fn pinHeld(self: *Pool, pgno: u32) Page {
-        self.lock();
-        defer self.mu.unlock(self.io);
-        const p = self.findHeld(pgno);
-        const fr = self.frameOf(p);
-        fr.pins += 1;
-        self.touch(fr);
-        return p;
-    }
-
-    /// Gives a page that an operation holds, without a change to its pins.
-    fn heldPage(self: *Pool, pgno: u32) Page {
-        self.lock();
-        defer self.mu.unlock(self.io);
-        return self.findHeld(pgno);
-    }
-
-    fn findHeld(self: *Pool, pgno: u32) Page {
-        const f = self.find(pgno) orelse @panic("page is not held");
-        std.debug.assert(self.frames[f].pins > 0);
-        return .{ .page = self.frameData(f), .pgno = pgno };
-    }
-
     fn flush(self: *Pool) !void {
         self.lock();
         defer self.mu.unlock(self.io);
@@ -795,9 +771,7 @@ pub const BPTree = struct {
             if (how != .write or p.kind() == .internal and isSafe(p, path.depth == 0))
                 self.releaseAbove(op);
             switch (p.kind()) {
-                .leaf => {
-                    return path;
-                },
+                .leaf => return path,
                 .internal => {},
                 else => return error.BadFile,
             }
@@ -933,12 +907,11 @@ pub const BPTree = struct {
 
         const parent = path[d - 1].page;
         const idx = path[d - 1].idx;
-        const li = if (idx > 0) idx - 1 else idx;
-        const sep_idx = li;
+        const sep_idx = if (idx > 0) idx - 1 else idx;
         const sib = path[d].sib.?;
         const left = if (idx > 0) sib else p;
         const right = if (idx > 0) p else sib;
-        std.debug.assert(parent.child(li) == left.pgno and parent.child(li + 1) == right.pgno);
+        std.debug.assert(parent.child(sep_idx) == left.pgno and parent.child(sep_idx + 1) == right.pgno);
         const leaf = left.kind() == .leaf;
 
         const cl = &op.scratch;
