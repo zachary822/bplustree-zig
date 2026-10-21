@@ -25,6 +25,7 @@ comptime {
 const meta_pgno = 0;
 const magic = "BPTWAL01";
 const meta_size = 32;
+const max_log_bytes = 10 << 20;
 
 /// The errors that the tree gives, in addition to the I/O errors.
 pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge, PoolExhausted, NoSpaceLeft };
@@ -505,6 +506,8 @@ pub const BPTree = struct {
         const epoch = self.pool.wal.epoch + 1;
         try self.metaWrite(epoch);
         try self.pool.file.sync(io);
+        if (try self.pool.wal.file.length(io) > max_log_bytes)
+            try self.pool.wal.file.setLength(io, 0);
         self.pool.wal.restart(epoch);
     }
 
