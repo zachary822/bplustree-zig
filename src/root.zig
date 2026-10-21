@@ -23,7 +23,8 @@ comptime {
 }
 
 const meta_pgno = 0;
-const magic = "BPTDISK1";
+const magic = "BPTWAL01";
+const meta_size = 32;
 
 /// The errors that the tree gives, in addition to the I/O errors.
 pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge, PoolExhausted, NoSpaceLeft };
@@ -76,12 +77,18 @@ const Frame = struct {
     dirty: bool = false,
     busy: bool = false,
     last_used: u64 = 0,
+    lsn: u64 = 0,
 };
 
 const Wal = struct {
     file: Io.File,
     mu: Io.Mutex = .init,
     end: std.atomic.Value(u64) = .init(0),
+    durable: std.atomic.Value(u64) = .init(0),
+    sync_mu: Io.Mutex = .init,
+    syncing: bool = false,
+    synced: Io.Condition = .init,
+    syncs: std.atomic.Value(u64) = .init(0),
     epoch: u32 = 0,
 
     const rec_hdr = 16;
@@ -127,6 +134,34 @@ const Wal = struct {
         off += rec_hdr;
         self.end.store(off, .release);
         return off;
+    }
+
+    fn flushTo(self: *Wal, io: Io, lsn: u64) !void {
+        if (lsn <= self.durable.load(.acquire)) return;
+        self.sync_mu.lockUncancelable(io);
+        defer self.sync_mu.unlock(io);
+        while (lsn > self.durable.load(.acquire)) {
+            if (self.syncing) {
+                self.synced.waitUncancelable(io, &self.sync_mu);
+                continue;
+            }
+            self.syncing = true;
+            const end = self.end.load(.acquire);
+            self.sync_mu.unlock(io);
+            const result = self.file.sync(io);
+            self.sync_mu.lockUncancelable(io);
+            self.syncing = false;
+            self.synced.broadcast(io);
+            try result;
+            _ = self.syncs.fetchAdd(1, .monotonic);
+            self.durable.store(end, .release);
+        }
+    }
+
+    fn restart(self: *Wal, epoch: u32) void {
+        self.epoch = epoch;
+        self.end.store(0, .release);
+        self.durable.store(0, .release);
     }
 
     fn next(self: *Wal, io: Io, off: u64, buf: *[page_size]u8) !?Record {
@@ -181,6 +216,11 @@ const Pool = struct {
         self.delay();
         try self.file.writePositionalAll(self.io, buf, @as(u64, pgno) * page_size);
         _ = self.writes.fetchAdd(1, .monotonic);
+    }
+
+    fn writeBack(self: *Pool, pgno: u32, lsn: u64, buf: *const [page_size]u8) !void {
+        try self.wal.flushTo(self.io, lsn);
+        try self.write(pgno, buf);
     }
 
     fn frameData(self: *Pool, f: usize) *[page_size]u8 {
@@ -242,9 +282,10 @@ const Pool = struct {
         const fr = &self.frames[f];
         if (fr.dirty) {
             const pgno = fr.pgno.?;
+            const lsn = fr.lsn;
             fr.busy = true;
             self.mu.unlock(self.io);
-            const result = self.write(pgno, self.frameData(f));
+            const result = self.writeBack(pgno, lsn, self.frameData(f));
             self.mu.lockUncancelable(self.io);
             fr.busy = false;
             self.cond.broadcast(self.io);
@@ -298,7 +339,7 @@ const Pool = struct {
         if (mode == .dirty) fr.dirty = true;
 
         if (build_options.pool_paranoid and fr.pins == 0) {
-            if (fr.dirty) self.write(fr.pgno.?, p.page) catch |err| std.debug.panic("unpin: {t}", .{err});
+            if (fr.dirty) self.writeBack(fr.pgno.?, fr.lsn, p.page) catch |err| std.debug.panic("unpin: {t}", .{err});
             fr.* = .{};
             @memset(p.page, 0xAA);
         }
@@ -328,6 +369,14 @@ const Pool = struct {
         return .{ .page = self.frameData(f) };
     }
 
+    fn unpinLogged(self: *Pool, p: Page, lsn: u64) void {
+        self.mu.lockUncancelable(self.io);
+        const fr = self.frameOf(p);
+        fr.lsn = @max(fr.lsn, lsn);
+        self.mu.unlock(self.io);
+        self.unpin(p, .dirty);
+    }
+
     fn pinAgain(self: *Pool, p: Page) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -347,7 +396,8 @@ const Pool = struct {
         defer self.mu.unlock(self.io);
         for (&self.frames, 0..) |*fr, f| {
             if (fr.dirty) {
-                try self.write(fr.pgno.?, self.frameData(f));
+                fr.lsn = 0;
+                try self.writeBack(fr.pgno.?, fr.lsn, self.frameData(f));
                 fr.dirty = false;
             }
         }
@@ -418,6 +468,7 @@ pub const BPTree = struct {
 
     root_latch: Io.RwLock = .init,
     alloc_mu: Io.Mutex = .init,
+    durable: bool = true,
 
     /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
     /// The caller owns `file` and must keep it open until `deinit`.
@@ -427,12 +478,15 @@ pub const BPTree = struct {
         var t: BPTree = .{ .pool = .{ .io = io, .file = file, .wal = .{ .file = log }, .mem = mem } };
 
         if (try file.length(io) == 0) {
+            try log.setLength(io, 0);
             t.npages = 1;
             const root = try t.pageAlloc(.leaf);
             t.root = t.pool.pgnoOf(root);
             t.pool.unpin(root, .dirty);
+            try t.sync();
         } else {
             try t.metaRead();
+            try t.recover(gpa);
         }
 
         return t;
@@ -445,29 +499,102 @@ pub const BPTree = struct {
 
     /// Writes all changed pages and the meta page, and then syncs the file.
     pub fn sync(self: *BPTree) !void {
+        const io = self.pool.io;
         try self.pool.flush();
-        try self.metaWrite();
-        try self.pool.file.sync(self.pool.io);
+        try self.pool.file.sync(io);
+        const epoch = self.pool.wal.epoch + 1;
+        try self.metaWrite(epoch);
+        try self.pool.file.sync(io);
+        self.pool.wal.restart(epoch);
     }
 
-    fn metaWrite(self: *BPTree) !void {
-        var buf: [page_size]u8 = @splat(0);
+    fn metaWrite(self: *BPTree, epoch: u32) !void {
+        var buf: [meta_size]u8 = undefined;
         @memcpy(buf[0..magic.len], magic);
         put32(buf[8..], @intCast(page_size));
-        put32(buf[12..], self.root);
-        put32(buf[16..], self.npages);
-        put32(buf[20..], self.freelist);
-        try self.pool.write(meta_pgno, &buf);
+        put32(buf[12..], epoch);
+        put32(buf[16..], self.root);
+        put32(buf[20..], self.npages);
+        put32(buf[24..], self.freelist);
+        put32(buf[28..], std.hash.Crc32.hash(buf[0..28]));
+        try self.pool.file.writePositionalAll(self.pool.io, &buf, epoch % 2 * (page_size / 2));
     }
 
     fn metaRead(self: *BPTree) !void {
-        var buf: [page_size]u8 = undefined;
-        try self.pool.read(meta_pgno, &buf);
+        var page: [page_size]u8 = undefined;
+        try self.pool.read(meta_pgno, &page);
+        var best: ?[]const u8 = null;
+        for ([_]usize{ 0, page_size / 2 }) |off| {
+            const m = page[off..][0..meta_size];
+            if (!std.mem.eql(u8, magic, m[0..magic.len]) or get32(m[8..]) != page_size) continue;
+            if (get32(m[28..]) != std.hash.Crc32.hash(m[0..28])) continue;
+            if (best == null or get32(m[12..]) > get32(best.?[12..])) best = m;
+        }
+        const m = best orelse return error.BadFile;
+        self.pool.wal.epoch = get32(m[12..]);
+        self.root = get32(m[16..]);
+        self.npages = get32(m[20..]);
+        self.freelist = get32(m[24..]);
+    }
 
-        if (!std.mem.eql(u8, magic, buf[0..magic.len]) or get32(buf[8..]) != page_size) return error.BadFile;
-        self.root = get32(buf[12..]);
-        self.npages = get32(buf[16..]);
-        self.freelist = get32(buf[20..]);
+    fn recover(self: *BPTree, gpa: Allocator) !void {
+        const io = self.pool.io;
+        const wal = &self.pool.wal;
+        var buf: [page_size]u8 = undefined;
+
+        var off: u64 = 0;
+        var committed: u64 = 0;
+        var root = self.root;
+        while (try wal.next(io, off, &buf)) |r| : (off = r.end) {
+            if (r.kind != .commit) continue;
+            committed = r.end;
+            if (r.arg != 0) root = r.arg;
+        }
+        if (off == 0) return;
+
+        off = 0;
+        while (off < committed) {
+            const r = (try wal.next(io, off, &buf)).?;
+            if (r.kind == .page) {
+                if (r.arg == meta_pgno) return error.BadFile;
+                try self.pool.write(r.arg, &buf);
+                self.npages = @max(self.npages, r.arg + 1);
+            }
+            off = r.end;
+        }
+        self.root = root;
+        try self.rebuildFreeList(gpa);
+        try self.sync();
+    }
+
+    fn rebuildFreeList(self: *BPTree, gpa: Allocator) !void {
+        const seen = try gpa.alloc(bool, self.npages);
+        defer gpa.free(seen);
+        @memset(seen, false);
+        try self.markReachable(seen, self.root, 0);
+        self.freelist = 0;
+        var pg = self.npages;
+        while (pg > 1) {
+            pg -= 1;
+            if (seen[pg]) continue;
+            const p = try self.pool.pin(pg, .no_load);
+            p.init(.free);
+            p.setLink(self.freelist);
+            self.freelist = pg;
+            self.pool.unpin(p, .dirty);
+        }
+    }
+
+    fn markReachable(self: *BPTree, seen: []bool, pgno: u32, depth: usize) !void {
+        if (pgno == meta_pgno or pgno >= self.npages or seen[pgno] or depth >= max_depth) return error.BadFile;
+        seen[pgno] = true;
+        const p = try self.getPage(pgno);
+        defer self.pool.unpin(p, .clean);
+        switch (p.kind()) {
+            .leaf => {},
+            .internal => for (0..p.count() + 1) |i| try self.markReachable(seen, p.child(i), depth + 1),
+            else => return error.BadFile,
+        }
     }
 
     /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
@@ -515,7 +642,7 @@ pub const BPTree = struct {
             const root = if (op.root_latch == .exclusive) self.root else 0;
             op.lsn = self.pool.wal.append(self.pool.io, op.changed.items(), pgnos[0..op.changed.len], root) catch |err|
                 std.debug.panic("commit: cannot write the log: {t}", .{err});
-            while (op.changed.pop()) |p| self.pool.unpin(p, .dirty);
+            while (op.changed.pop()) |p| self.pool.unpinLogged(p, op.lsn);
         }
         if (op.freed.len > 0) {
             self.alloc_mu.lockUncancelable(self.pool.io);
@@ -524,7 +651,7 @@ pub const BPTree = struct {
                 self.freelist = self.pool.pgnoOf(p);
             }
             self.alloc_mu.unlock(self.pool.io);
-            while (op.freed.pop()) |p| self.pool.unpin(p, .dirty);
+            while (op.freed.pop()) |p| self.pool.unpinLogged(p, op.lsn);
         }
     }
 
@@ -756,8 +883,9 @@ pub const BPTree = struct {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
         var op: Op = .{};
-        if (try self.putIn(&op, key, val, .optimistic)) return;
-        _ = try self.putIn(&op, key, val, .write);
+        if (!try self.putIn(&op, key, val, .optimistic))
+            _ = try self.putIn(&op, key, val, .write);
+        if (self.durable) try self.pool.wal.flushTo(self.pool.io, op.lsn);
     }
 
     /// The caller holds the path and the siblings, and reserves the new pages.
@@ -868,8 +996,9 @@ pub const BPTree = struct {
     pub fn delete(self: *BPTree, key: []const u8) !bool {
         if (key.len > max_key) return error.KeyTooLarge;
         var op: Op = .{};
-        if (try self.deleteIn(&op, key, .optimistic)) |found| return found;
-        return (try self.deleteIn(&op, key, .write)).?;
+        const found = try self.deleteIn(&op, key, .optimistic) orelse (try self.deleteIn(&op, key, .write)).?;
+        if (self.durable) try self.pool.wal.flushTo(self.pool.io, op.lsn);
+        return found;
     }
 
     /// Calls `visit` for each key in `lo..hi`, both inclusive. A null bound has no limit.
@@ -1255,8 +1384,16 @@ test BPTree {
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit(std.testing.allocator);
 
-    try t.metaWrite();
+    try t.metaWrite(5);
     try t.metaRead();
+    try std.testing.expectEqual(5, t.pool.wal.epoch);
+    // The newer of the two copies wins, and a torn copy is ignored.
+    try t.metaWrite(6);
+    try t.metaRead();
+    try std.testing.expectEqual(6, t.pool.wal.epoch);
+    try file.writePositionalAll(std.testing.io, "x", 3);
+    try t.metaRead();
+    try std.testing.expectEqual(5, t.pool.wal.epoch);
 }
 
 test "BPTree sync and reopen" {
@@ -1283,6 +1420,63 @@ test "BPTree sync and reopen" {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
         try std.testing.expectEqualStrings("value", (try t.get(k, &out)).?);
     }
+}
+
+test "BPTree recovers after a crash" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+
+    var kbuf: [16]u8 = undefined;
+    var out: [max_val]u8 = undefined;
+    const N = 2000;
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit(std.testing.allocator);
+        for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
+        for (0..N) |i| {
+            if (i % 3 == 0) _ = try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}));
+        }
+        // No sync: deinit drops the pool, as a crash would. Some pages reached the file and some did not.
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit(std.testing.allocator);
+    try t.check(std.testing.allocator);
+    for (0..N) |i| {
+        const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out);
+        if (i % 3 == 0) try std.testing.expectEqual(null, got) else try std.testing.expectEqualStrings("value", got.?);
+    }
+}
+
+test "BPTree recovery ignores an operation that did not commit" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+
+    var kbuf: [16]u8 = undefined;
+    var out: [max_val]u8 = undefined;
+    const N = 500;
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit(std.testing.allocator);
+        for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
+        // An operation that crashed after it logged an image of the root, but before its commit record.
+        var junk: [page_size]u8 = @splat(0xEE);
+        const end = try t.pool.wal.append(io, &.{.{ .page = &junk }}, &.{t.root}, 0);
+        try log.setLength(io, end - Wal.rec_hdr);
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit(std.testing.allocator);
+    try t.check(std.testing.allocator);
+    for (0..N) |i| try std.testing.expectEqualStrings("value", (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out)).?);
 }
 
 test "BPTree bad file" {

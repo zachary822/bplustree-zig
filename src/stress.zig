@@ -271,8 +271,10 @@ fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !
     var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
     var kbuf: [16]u8 = undefined;
     var vbuf: [bpt.max_val]u8 = undefined;
+    t.durable = false;
     for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
     try t.sync();
+    t.durable = true;
     for (0..crash_threads) |id| _ = try std.Thread.spawn(.{}, crashWorker, .{ &t, id, seed + id });
     try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
     // Like a crash of the process: no sync, no deinit, and the threads stop wherever they are.
@@ -356,6 +358,7 @@ pub fn main(init: std.process.Init) !void {
             const n = try t.scan(null, null, &c, ScanCheck.visit);
             c.missing(test_keys);
             if (n != present) fail("scan of all keys gives {d} keys, but {d} are in the tree", .{ n, present });
+            try t.sync();
             std.debug.print("round {d}: ok, {d} keys\n", .{ round, present });
         }
         std.debug.print("stress test passed: {d} threads, {d} ops each, {d} rounds, {d} retries\n", .{ sh.threads, sh.ops, rounds, sh.retries.raw });
@@ -363,15 +366,20 @@ pub fn main(init: std.process.Init) !void {
         var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 3, 90), .ops = try arg(args, 4, 50000) };
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
+        // Load without waiting for the log after every put. The sync at the end makes it all durable.
+        t.durable = false;
         for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), &val);
         try t.sync();
+        t.durable = args.len <= 5 or !std.mem.eql(u8, args[5], "nosync");
 
+        const syncs = t.pool.wal.syncs.raw;
         const start = Io.Clock.Timestamp.now(io, .awake);
         try run(benchWorker, &sh, 7);
         const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
         const total = sh.threads * sh.ops;
-        std.debug.print("threads={d} reads={d}% ops={d} time_ms={d} ops_per_s={d} retries={d}\n", .{
-            sh.threads, sh.read_pct, total, ns / std.time.ns_per_ms, total * std.time.ns_per_s / ns, sh.retries.raw,
+        std.debug.print("threads={d} reads={d}% ops={d} time_ms={d} ops_per_s={d} retries={d} log_syncs={d}\n", .{
+            sh.threads,                     sh.read_pct,    total,                        ns / std.time.ns_per_ms,
+            total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs,
         });
     } else {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
