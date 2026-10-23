@@ -2,6 +2,7 @@
 //!
 //!   stress test [threads] [ops per thread] [rounds]
 //!   stress bench [threads] [read percent] [ops per thread]
+//!   stress scanmix [scan percent] [update percent] [ops] [nosync]
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -10,6 +11,11 @@ const bpt = @import("bplustree_zig");
 const test_keys = 20000;
 /// The benchmark loads this many keys first.
 const bench_keys = 50000;
+/// The hot keys of `scanmix`: `hot_runs` runs of `hot_len` keys, spread over the keys of the benchmark.
+const hot_runs = 4;
+const hot_len = 16;
+/// The number of keys in one scan of `scanmix`.
+const scan_len = 1000;
 /// A run that takes longer than this has hung.
 const timeout_s = 600;
 
@@ -138,7 +144,7 @@ fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
             const n = while (true) {
                 // A scan that fails part of the way can visit keys before it fails, so start the check again.
                 c = .{ .sh = sh, .id = id, .lo = lo, .hi = hi, .next = lo };
-                break t.scan(keyOf(&lbuf, lo), keyOf(&hbuf, hi), &c, ScanCheck.visit) catch |err| {
+                break t.scan(keyOf(&lbuf, lo), keyOf(&hbuf, hi + 1), &c, ScanCheck.visit) catch |err| {
                     try sh.again(err);
                     continue;
                 };
@@ -191,6 +197,59 @@ fn benchWorker(sh: *Shared, id: usize, seed: u64) !void {
             };
         }
     }
+}
+
+/// Scans `scan_len` keys in `scan_pct` percent of the operations, and updates any key (a get and then a put)
+/// in `update_pct` percent. The other operations are gets, 9 of 10 to a hot key.
+/// It runs in one thread, so the pool counters show which operation read which pages.
+fn scanmix(t: *bpt.BPTree, io: Io, scan_pct: usize, update_pct: usize, ops: usize) !void {
+    var prng: std.Random.DefaultPrng = .init(7);
+    const rand = prng.random();
+    var kbuf: [16]u8 = undefined;
+    var hbuf: [16]u8 = undefined;
+    var out: [bpt.max_val]u8 = undefined;
+    const Count = struct {
+        fn visit(_: void, _: []const u8, _: []const u8) !void {}
+    };
+    const pool = &t.pool;
+
+    var get_lookups: u64 = 0;
+    var get_reads: u64 = 0;
+    var scan_reads: u64 = 0;
+    const writes = pool.writes.raw;
+    const syncs = pool.wal.syncs.raw;
+    const moves = pool.hand.raw;
+    const start = Io.Clock.Timestamp.now(io, .awake);
+    for (0..ops) |_| {
+        const lookups = pool.lookups.raw;
+        const reads = pool.reads.raw;
+        const roll = rand.uintLessThan(usize, 100);
+        if (roll < scan_pct) {
+            const lo = rand.uintLessThan(usize, bench_keys - scan_len);
+            _ = try t.scan(keyOf(&kbuf, lo), keyOf(&hbuf, lo + scan_len), {}, Count.visit);
+            scan_reads += pool.reads.raw - reads;
+            continue;
+        }
+        if (roll < scan_pct + update_pct) {
+            const key = keyOf(&kbuf, rand.uintLessThan(usize, bench_keys));
+            const v = (try t.get(key, &out)).?;
+            try t.put(key, v);
+            continue;
+        }
+        // 9 of 10 gets go to a hot key, and the rest to any key.
+        const k = if (rand.uintLessThan(usize, 10) < 9)
+            rand.uintLessThan(usize, hot_runs) * (bench_keys / hot_runs) + rand.uintLessThan(usize, hot_len)
+        else
+            rand.uintLessThan(usize, bench_keys);
+        _ = try t.get(keyOf(&kbuf, k), &out);
+        get_lookups += pool.lookups.raw - lookups;
+        get_reads += pool.reads.raw - reads;
+    }
+    const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+    const hit = 100 * @as(f64, @floatFromInt(get_lookups - get_reads)) / @as(f64, @floatFromInt(get_lookups));
+    std.debug.print("scans={d}% updates={d}% ops={d} time_ms={d} get_reads={d} get_hit_rate={d:.2}% scan_reads={d} writes={d} log_syncs={d} hand_moves={d}\n", .{
+        scan_pct, update_pct, ops, ns / std.time.ns_per_ms, get_reads, hit, scan_reads, pool.writes.raw - writes, pool.wal.syncs.raw - syncs, pool.hand.raw - moves,
+    });
 }
 
 fn run(comptime worker: anytype, sh: *Shared, seed: u64) !void {
@@ -373,18 +432,26 @@ pub fn main(init: std.process.Init) !void {
         t.durable = args.len <= 5 or !std.mem.eql(u8, args[5], "nosync");
 
         const syncs = t.pool.wal.syncs.raw;
-        const locks = t.pool.locks;
+        const locks = t.pool.locks.raw;
         const start = Io.Clock.Timestamp.now(io, .awake);
         try run(benchWorker, &sh, 7);
         const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
         const total = sh.threads * sh.ops;
         std.debug.print("threads={d} reads={d}% ops={d} time_ms={d} ops_per_s={d} retries={d} log_syncs={d} pool_locks_per_op={d:.2}\n", .{
             sh.threads,                     sh.read_pct,    total,                        ns / std.time.ns_per_ms,
-            total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs, @as(f64, @floatFromInt(t.pool.locks - locks)) / @as(f64, @floatFromInt(total)),
+            total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs, @as(f64, @floatFromInt(t.pool.locks.raw - locks)) / @as(f64, @floatFromInt(total)),
         });
+    } else if (std.mem.eql(u8, mode, "scanmix")) {
+        var kbuf: [16]u8 = undefined;
+        const val: [50]u8 = @splat('v');
+        t.durable = false;
+        for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), &val);
+        try t.sync();
+        t.durable = args.len <= 5 or !std.mem.eql(u8, args[5], "nosync");
+        try scanmix(&t, io, try arg(args, 2, 5), try arg(args, 3, 0), try arg(args, 4, 50000));
     } else {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
-            " | stress crash <file> <seed> <ms> | stress verify <file>\n", .{});
+            " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>\n", .{});
         return error.BadArgs;
     }
 }

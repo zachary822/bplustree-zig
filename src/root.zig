@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 
 const page_size = build_options.page_size;
 const pool_frames = build_options.pool_frames;
+const max_usage = build_options.max_usage;
 
 /// The maximum length of a key.
 pub const max_key = page_size / 16;
@@ -71,14 +72,32 @@ fn Stack(comptime T: type, comptime cap: usize) type {
     };
 }
 
-const Frame = struct {
-    /// The page in this frame, or null if the frame is free.
-    pgno: ?u32 = null,
-    pins: u32 = 0,
+const State = packed struct(u32) {
+    pins: u24 = 0,
+    usage: u4 = 0,
+    mapped: bool = false,
+    valid: bool = false,
     dirty: bool = false,
-    busy: bool = false,
-    last_used: u64 = 0,
-    lsn: u64 = 0,
+    io: bool = false,
+};
+
+comptime {
+    std.debug.assert(max_usage <= std.math.maxInt(u4));
+}
+
+const Frame = struct {
+    state: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+    pgno: ?u32 = null,
+    lsn: std.atomic.Value(u64) = .init(0),
+
+    fn load(self: *const Frame) State {
+        return @bitCast(self.state.load(.acquire));
+    }
+
+    fn cas(self: *Frame, old: State, new: State) ?State {
+        const found = self.state.cmpxchgWeak(@bitCast(old), @bitCast(new), .acq_rel, .acquire) orelse return null;
+        return @bitCast(found);
+    }
 };
 
 const Wal = struct {
@@ -183,6 +202,13 @@ const Wal = struct {
     }
 };
 
+const table_parts = 128;
+
+const Partition = struct {
+    lock: Io.RwLock align(std.atomic.cache_line) = .init,
+    map: std.AutoHashMapUnmanaged(u32, usize) = .empty,
+};
+
 /// The buffer pool: a fixed set of frames that keep pages of the file in memory.
 const Pool = struct {
     io: Io,
@@ -190,14 +216,14 @@ const Pool = struct {
     wal: Wal,
     frames: [pool_frames]Frame = @splat(.{}),
     mem: []u8,
-    tick: u64 = 0,
+    table: [table_parts]Partition = @splat(.{}),
+    hand: std.atomic.Value(u64) = .init(0),
     reads: std.atomic.Value(u64) = .init(0),
     writes: std.atomic.Value(u64) = .init(0),
+    lookups: std.atomic.Value(u64) = .init(0),
 
-    mu: Io.Mutex = .init,
-    cond: Io.Condition = .init,
     latches: [pool_frames]Io.RwLock = @splat(.init),
-    locks: u64 = 0,
+    locks: std.atomic.Value(u64) = .init(0),
 
     const Load = enum { load, no_load };
     const Unpin = union(enum) {
@@ -206,14 +232,31 @@ const Pool = struct {
         logged: u64,
     };
 
+    fn initTable(self: *Pool, gpa: Allocator) !void {
+        errdefer self.deinitTable(gpa);
+        for (&self.table) |*part| try part.map.ensureTotalCapacity(gpa, pool_frames);
+    }
+
+    fn deinitTable(self: *Pool, gpa: Allocator) void {
+        for (&self.table) |*part| part.map.deinit(gpa);
+    }
+
     fn deinit(self: *Pool, gpa: Allocator) void {
         std.debug.assert(self.pinned() == 0);
+        self.deinitTable(gpa);
         gpa.free(self.mem);
     }
 
-    fn lock(self: *Pool) void {
-        self.mu.lockUncancelable(self.io);
-        self.locks += 1;
+    fn partition(self: *Pool, pgno: u32) *Partition {
+        return &self.table[pgno % table_parts];
+    }
+
+    fn lockPart(self: *Pool, part: *Partition, mode: Latch) void {
+        switch (mode) {
+            .shared => part.lock.lockSharedUncancelable(self.io),
+            .exclusive => part.lock.lockUncancelable(self.io),
+        }
+        _ = self.locks.fetchAdd(1, .monotonic);
     }
 
     fn read(self: *Pool, pgno: u32, buf: *[page_size]u8) !void {
@@ -242,10 +285,6 @@ const Pool = struct {
         return (@intFromPtr(p.page) - @intFromPtr(self.mem.ptr)) / page_size;
     }
 
-    fn frameOf(self: *Pool, p: Page) *Frame {
-        return &self.frames[self.frameIndex(p)];
-    }
-
     fn latch(self: *Pool, p: Page, mode: Latch) void {
         const l = &self.latches[self.frameIndex(p)];
         switch (mode) {
@@ -271,115 +310,229 @@ const Pool = struct {
     }
 
     fn find(self: *Pool, pgno: u32) ?usize {
-        for (self.frames, 0..) |fr, f| {
-            if (fr.pgno == pgno) return f;
-        }
-        return null;
+        const part = self.partition(pgno);
+        self.lockPart(part, .shared);
+        defer part.lock.unlockShared(self.io);
+        return part.map.get(pgno);
     }
 
-    fn touch(self: *Pool, fr: *Frame) void {
-        self.tick += 1;
-        fr.last_used = self.tick;
+    fn pinFound(fr: *Frame) void {
+        var s = fr.load();
+        while (true) {
+            var n = s;
+            n.pins += 1;
+            if (n.usage < max_usage) n.usage += 1;
+            s = fr.cas(s, n) orelse return;
+        }
+    }
+
+    fn unpinFrame(fr: *Frame, dirty: bool) State {
+        var s = fr.load();
+        while (true) {
+            var n = s;
+            n.pins -= 1;
+            if (dirty) n.dirty = true;
+            s = fr.cas(s, n) orelse return n;
+        }
+    }
+
+    fn waitIo(self: *Pool, fr: *Frame) State {
+        while (true) {
+            const s = fr.load();
+            if (!s.io) return s;
+            self.io.futexWaitUncancelable(u32, &fr.state.raw, @bitCast(s));
+        }
+    }
+
+    fn endIo(self: *Pool, fr: *Frame, valid: bool, clean: bool) void {
+        var s = fr.load();
+        while (true) {
+            var n = s;
+            n.io = false;
+            if (valid) n.valid = true;
+            if (clean) n.dirty = false;
+            s = fr.cas(s, n) orelse break;
+        }
+        self.io.futexWake(u32, &fr.state.raw, std.math.maxInt(u32));
+    }
+
+    fn sweep(self: *Pool) !usize {
+        var tries: usize = pool_frames;
+        while (true) {
+            const f: usize = @intCast(self.hand.fetchAdd(1, .monotonic) % pool_frames);
+            const fr = &self.frames[f];
+            var s = fr.load();
+            while (true) {
+                if (s.pins != 0) {
+                    tries -= 1;
+                    if (tries == 0) return error.PoolExhausted;
+                    break;
+                }
+                var n = s;
+                if (s.usage != 0) {
+                    n.usage -= 1;
+                    s = fr.cas(s, n) orelse {
+                        tries = pool_frames;
+                        break;
+                    };
+                } else {
+                    n.pins = 1;
+                    s = fr.cas(s, n) orelse return f;
+                }
+            }
+        }
+    }
+
+    fn writeVictim(self: *Pool, f: usize) !bool {
+        const fr = &self.frames[f];
+        var s = fr.load();
+        while (true) {
+            if (s.pins != 1) return false;
+            var n = s;
+            n.io = true;
+            s = fr.cas(s, n) orelse break;
+        }
+        const result = self.writeBack(fr.pgno.?, fr.lsn.load(.acquire), self.frameData(f));
+        self.endIo(fr, false, if (result) |_| true else |_| false);
+        try result;
+        return true;
+    }
+
+    fn unmap(self: *Pool, f: usize) bool {
+        const fr = &self.frames[f];
+        const pgno = fr.pgno.?;
+        const part = self.partition(pgno);
+        self.lockPart(part, .exclusive);
+        defer part.lock.unlock(self.io);
+        var s = fr.load();
+        while (true) {
+            if (s.pins != 1 or s.dirty) return false;
+            s = fr.cas(s, .{ .pins = 1 }) orelse break;
+        }
+        _ = part.map.remove(pgno);
+        fr.pgno = null;
+        return true;
     }
 
     fn victim(self: *Pool) !usize {
-        var best: ?usize = null;
-        for (&self.frames, 0..) |*fr, f| {
-            if (fr.pgno == null) return f;
-            if (fr.pins == 0 and !fr.busy and (best == null or fr.last_used < self.frames[best.?].last_used))
-                best = f;
+        while (true) {
+            const f = try self.sweep();
+            const fr = &self.frames[f];
+            const s = fr.load();
+            if (s.dirty) {
+                const written = self.writeVictim(f) catch |err| {
+                    _ = unpinFrame(fr, false);
+                    return err;
+                };
+                if (!written) {
+                    _ = unpinFrame(fr, false);
+                    continue;
+                }
+            }
+            if (s.mapped and !self.unmap(f)) {
+                _ = unpinFrame(fr, false);
+                continue;
+            }
+            return f;
         }
-        const f = best orelse return error.PoolExhausted;
+    }
+
+    fn readFrame(self: *Pool, f: usize) !void {
         const fr = &self.frames[f];
-        if (fr.dirty) {
-            const pgno = fr.pgno.?;
-            const lsn = fr.lsn;
-            fr.busy = true;
-            self.mu.unlock(self.io);
-            const result = self.writeBack(pgno, lsn, self.frameData(f));
-            self.lock();
-            fr.busy = false;
-            self.cond.broadcast(self.io);
-            try result;
+        const result = self.read(fr.pgno.?, self.frameData(f));
+        self.endIo(fr, if (result) |_| true else |_| false, false);
+        return result;
+    }
+
+    fn ready(self: *Pool, f: usize) !Page {
+        const fr = &self.frames[f];
+        while (true) {
+            const s = self.waitIo(fr);
+            if (s.valid) break;
+            var n = s;
+            n.io = true;
+            if (fr.cas(s, n) == null) {
+                self.readFrame(f) catch |err| {
+                    _ = unpinFrame(fr, false);
+                    return err;
+                };
+                break;
+            }
         }
-        fr.* = .{};
-        return f;
+        return .{ .page = self.frameData(f), .pgno = fr.pgno.? };
     }
 
     fn pin(self: *Pool, pgno: u32, mode: Load) !Page {
         std.debug.assert(pgno != meta_pgno);
-        self.lock();
-        defer self.mu.unlock(self.io);
-        const f = while (true) {
-            if (self.find(pgno)) |i| {
-                const fr = &self.frames[i];
-                if (fr.busy) {
-                    self.cond.waitUncancelable(self.io, &self.mu);
-                    continue;
-                }
-                fr.pins += 1;
-                self.touch(fr);
-                return .{ .page = self.frameData(i), .pgno = pgno };
-            }
-            const v = try self.victim();
-            if (self.find(pgno) == null) break v;
-        };
-        const fr = &self.frames[f];
-        fr.* = .{ .pgno = pgno, .pins = 1, .busy = mode == .load };
-        self.touch(fr);
-        if (mode == .load) {
-            self.mu.unlock(self.io);
-            const result = self.read(pgno, self.frameData(f));
-            self.lock();
-            fr.busy = false;
-            self.cond.broadcast(self.io);
-            result catch |err| {
-                fr.* = .{};
-                return err;
-            };
+        _ = self.lookups.fetchAdd(1, .monotonic);
+        const part = self.partition(pgno);
+        self.lockPart(part, .shared);
+        if (part.map.get(pgno)) |f| {
+            pinFound(&self.frames[f]);
+            part.lock.unlockShared(self.io);
+            return self.ready(f);
         }
-        return .{ .page = self.frameData(f), .pgno = pgno };
+        part.lock.unlockShared(self.io);
+
+        const v = try self.victim();
+        const fr = &self.frames[v];
+        self.lockPart(part, .exclusive);
+        const entry = part.map.getOrPutAssumeCapacity(pgno);
+        if (entry.found_existing) {
+            // another thread put the page in a frame while this one looked for a victime. the victim stays empty.
+            _ = unpinFrame(fr, false);
+            const f = entry.value_ptr.*;
+            pinFound(&self.frames[f]);
+            part.lock.unlock(self.io);
+            return self.ready(f);
+        }
+        entry.value_ptr.* = v;
+        fr.pgno = pgno;
+        fr.lsn.store(0, .monotonic);
+
+        fr.state.store(@bitCast(State{ .pins = 1, .usage = 1, .mapped = true, .valid = mode == .no_load, .io = mode == .load }), .release);
+        part.lock.unlock(self.io);
+        if (mode == .load) self.readFrame(v) catch |err| {
+            _ = unpinFrame(fr, false);
+            return err;
+        };
+        return .{ .page = self.frameData(v), .pgno = pgno };
     }
 
     fn unpin(self: *Pool, p: Page, mode: Unpin) void {
-        self.lock();
-        defer self.mu.unlock(self.io);
-        const fr = self.frameOf(p);
-        std.debug.assert(fr.pgno != null and fr.pins > 0);
-        fr.pins -= 1;
-        switch (mode) {
-            .clean => {},
-            .dirty => fr.dirty = true,
-            .logged => |lsn| {
-                fr.dirty = true;
-                fr.lsn = @max(fr.lsn, lsn);
-            },
-        }
+        const f = self.frameIndex(p);
+        const fr = &self.frames[f];
+        std.debug.assert(fr.load().pins > 0);
+        if (mode == .logged) _ = fr.lsn.fetchMax(mode.logged, .release);
+        const s = unpinFrame(fr, mode != .clean);
+        if (build_options.pool_paranoid and s.pins == 0) self.drop(f);
+    }
 
-        if (build_options.pool_paranoid and fr.pins == 0) {
-            if (fr.dirty) self.writeBack(fr.pgno.?, fr.lsn, p.page) catch |err| std.debug.panic("unpin: {t}", .{err});
-            fr.* = .{};
-            @memset(p.page, 0xAA);
+    fn drop(self: *Pool, f: usize) void {
+        const fr = &self.frames[f];
+        var s = fr.load();
+        while (true) {
+            if (s.pins != 0 or !s.mapped) return;
+            var n = s;
+            n.pins = 1;
+            s = fr.cas(s, n) orelse break;
         }
+        const written = !s.dirty or self.writeVictim(f) catch |err| std.debug.panic("unpin: {t}", .{err});
+        if (written and self.unmap(f)) @memset(self.frameData(f), 0xAA);
+        _ = unpinFrame(fr, false);
     }
 
     fn flush(self: *Pool) !void {
-        self.lock();
-        defer self.mu.unlock(self.io);
         for (&self.frames, 0..) |*fr, f| {
-            if (fr.dirty) {
-                fr.lsn = 0;
-                try self.writeBack(fr.pgno.?, fr.lsn, self.frameData(f));
-                fr.dirty = false;
-            }
+            if (!fr.load().dirty) continue;
+            try self.write(fr.pgno.?, self.frameData(f));
+            self.endIo(fr, false, true);
         }
     }
 
     fn pinned(self: *Pool) usize {
-        self.lock();
-        defer self.mu.unlock(self.io);
         var n: usize = 0;
-        for (self.frames) |fr| n += fr.pins;
+        for (&self.frames) |*fr| n += fr.load().pins;
         return n;
     }
 
@@ -465,6 +618,8 @@ pub const BPTree = struct {
         const mem = try gpa.alloc(u8, page_size * pool_frames);
         errdefer gpa.free(mem);
         var t: BPTree = .{ .pool = .{ .io = io, .file = file, .wal = .{ .file = log }, .mem = mem } };
+        try t.pool.initTable(gpa);
+        errdefer t.pool.deinitTable(gpa);
 
         if (try file.length(io) == 0) {
             try log.setLength(io, 0);
@@ -991,7 +1146,7 @@ pub const BPTree = struct {
         return found;
     }
 
-    /// Calls `visit` for each key in `lo..hi`, both inclusive. A null bound has no limit.
+    /// Calls `visit` for each key in `lo..hi`. `lo` is inclusive and `hi` is exclusive. A null bound has no limit.
     /// The key and value slices are valid only during the call to `visit`.
     pub fn scan(
         self: *BPTree,
@@ -1020,7 +1175,7 @@ pub const BPTree = struct {
                 const first = i;
                 for (i..leaf.count()) |j| {
                     const k = leaf.cellKey(j);
-                    if (hi) |h| if (std.mem.lessThan(u8, h, k)) return count;
+                    if (hi) |h| if (!std.mem.lessThan(u8, k, h)) return count;
                     try visit(ctx, k, leaf.leafVal(j));
                     count += 1;
                 }
@@ -1641,6 +1796,163 @@ test "BPTree page alloc" {
     try std.testing.expectEqual(0, t.pool.pinned());
 }
 
+/// A pin of page `pgno` and its unpin, with no I/O.
+fn testPin(pool: *Pool, pgno: u32) !void {
+    pool.unpin(try pool.pin(pgno, .no_load), .clean);
+}
+
+/// Empties the pool of a new tree.
+fn testEmptyPool(t: *BPTree) void {
+    // init synced the tree, so no frame is dirty and the pages can go.
+    t.pool.frames = @splat(.{});
+    for (&t.pool.table) |*part| part.map.clearRetainingCapacity();
+    t.pool.hand.store(0, .monotonic);
+}
+
+/// Sets the usage count of a frame that no other thread uses.
+fn testSetUsage(fr: *Frame, usage: u4) void {
+    var s = fr.load();
+    s.usage = usage;
+    fr.state.store(@bitCast(s), .monotonic);
+}
+
+test "Pool usage count" {
+    if (build_options.pool_paranoid) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
+    defer t.deinit(std.testing.allocator);
+    testEmptyPool(&t);
+
+    // A miss gives a usage count of 1, and each pin of the page in the pool adds 1, up to max_usage.
+    try testPin(&t.pool, 1);
+    const fr = &t.pool.frames[t.pool.find(1).?];
+    try std.testing.expectEqual(1, fr.load().usage);
+    for (0..max_usage + 3) |i| {
+        try testPin(&t.pool, 1);
+        try std.testing.expectEqual(@min(i + 2, max_usage), fr.load().usage);
+    }
+
+    // Two owners pin the page at the same time: each pin counts. An unpin does not change the count.
+    testSetUsage(fr, 0);
+    const a = try t.pool.pin(1, .no_load);
+    const b = try t.pool.pin(1, .no_load);
+    try std.testing.expectEqual(@min(2, max_usage), fr.load().usage);
+    t.pool.unpin(a, .clean);
+    t.pool.unpin(b, .clean);
+    try std.testing.expectEqual(@min(2, max_usage), fr.load().usage);
+    try std.testing.expectEqual(0, t.pool.pinned());
+}
+
+test "Pool clock sweep" {
+    // The test gives page 1 a usage count of 3.
+    if (build_options.pool_paranoid or max_usage < 3) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
+    defer t.deinit(std.testing.allocator);
+    testEmptyPool(&t);
+
+    // An empty frame has no pins and a usage count of 0, so the sweep takes the empty frames in order.
+    // Pages 1 to pool_frames fill them, each with a usage count of 1, and the hand goes round once.
+    // Two more pins give page 1 a usage count of 3.
+    for (1..pool_frames + 1) |pg| try testPin(&t.pool, @intCast(pg));
+    for (0..pool_frames) |f| try std.testing.expectEqual(f + 1, t.pool.frames[f].pgno.?);
+    try testPin(&t.pool, 1);
+    try testPin(&t.pool, 1);
+    try std.testing.expectEqual(3, t.pool.frames[0].load().usage);
+    try std.testing.expectEqual(0, t.pool.hand.raw % pool_frames);
+
+    // The first pass takes page 1 to 2 and the others to 0. The second pass takes page 1 to 1,
+    // and page 2 (frame 1) is the victim.
+    const moves = t.pool.hand.raw;
+    try testPin(&t.pool, pool_frames + 1);
+    try std.testing.expectEqual(pool_frames + 2, t.pool.hand.raw - moves);
+    try std.testing.expectEqual(2, t.pool.hand.raw % pool_frames);
+    try std.testing.expectEqual(pool_frames + 1, t.pool.frames[1].pgno.?);
+    try std.testing.expectEqual(1, t.pool.frames[0].load().usage);
+    try std.testing.expectEqual(1, t.pool.frames[1].load().usage);
+    for (2..pool_frames) |f| try std.testing.expectEqual(0, t.pool.frames[f].load().usage);
+
+    // The next miss takes the frame under the hand at once: page 3, with a usage count of 0.
+    try testPin(&t.pool, pool_frames + 2);
+    try std.testing.expectEqual(pool_frames + 2, t.pool.frames[2].pgno.?);
+    try std.testing.expectEqual(null, t.pool.find(3));
+}
+
+test "Pool clock sweep skips pinned frames" {
+    if (build_options.pool_paranoid) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
+    defer t.deinit(std.testing.allocator);
+    testEmptyPool(&t);
+
+    var pinned: [pool_frames]Page = undefined;
+    for (&pinned, 1..) |*p, pg| p.* = try t.pool.pin(@intCast(pg), .no_load);
+    // Every frame has a pin. One pass with no change to a usage count gives up.
+    const moves = t.pool.hand.raw;
+    try std.testing.expectError(error.PoolExhausted, t.pool.pin(pool_frames + 1, .no_load));
+    try std.testing.expectEqual(pool_frames, t.pool.hand.raw - moves);
+
+    // With one frame free of pins, the sweep finds it, however many pinned frames it passes.
+    const last = pool_frames - 1;
+    t.pool.unpin(pinned[last], .clean);
+    const p = try t.pool.pin(pool_frames + 1, .no_load);
+    try std.testing.expectEqual(last, t.pool.frameIndex(p));
+    t.pool.unpin(p, .clean);
+    for (pinned[0..last]) |q| t.pool.unpin(q, .clean);
+    try std.testing.expectEqual(0, t.pool.pinned());
+}
+
+test "Pool miss gives up a victim that another thread pinned" {
+    if (build_options.pool_paranoid) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
+    defer t.deinit(std.testing.allocator);
+    testEmptyPool(&t);
+    const pool = &t.pool;
+
+    // Page 1 is in frame 0 with a usage count of 0. With the hand back on frame 0, the sweep takes it and pins it.
+    try testPin(pool, 1);
+    const f = pool.find(1).?;
+    testSetUsage(&pool.frames[f], 0);
+    pool.hand.store(f, .monotonic);
+    try std.testing.expectEqual(f, try pool.sweep());
+
+    // Before the miss changes the page table, another thread finds page 1 in it and pins it.
+    const p = try pool.pin(1, .no_load);
+    // The miss sees the second pin: it neither writes the page nor takes it out of the page table.
+    const writes = pool.writes.raw;
+    try std.testing.expect(!try pool.writeVictim(f));
+    try std.testing.expect(!pool.unmap(f));
+    try std.testing.expectEqual(writes, pool.writes.raw);
+    try std.testing.expectEqual(1, pool.frames[f].pgno.?);
+
+    // The miss gives the frame back. The page stays in its frame for the other thread.
+    _ = Pool.unpinFrame(&pool.frames[f], false);
+    try std.testing.expectEqual(1, pool.pinned());
+    try std.testing.expectEqual(f, pool.find(1).?);
+    pool.unpin(p, .clean);
+}
+
 test "BPTree get" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1833,10 +2145,15 @@ test "BPTree scan" {
     try std.testing.expectEqual(N / 2, try t.scan(null, null, &c, Check.visit));
     try std.testing.expectEqual(0, t.pool.pinned());
 
-    // Both bounds are inclusive. A bound between two keys starts or stops at the nearest key inside it.
+    // The lower bound is inclusive and the upper bound is exclusive. A bound between two keys starts or stops at the nearest key inside it.
     c = .{ .next = 101 };
-    try std.testing.expectEqual(700, try t.scan("key00000101", "key00001499", &c, Check.visit));
+    try std.testing.expectEqual(700, try t.scan("key00000101", "key00001501", &c, Check.visit));
     try std.testing.expectEqual(1501, c.next);
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    c = .{ .next = 101 };
+    try std.testing.expectEqual(699, try t.scan("key00000101", "key00001499", &c, Check.visit));
+    try std.testing.expectEqual(1499, c.next);
     try std.testing.expectEqual(0, t.pool.pinned());
 
     c = .{ .next = 101 };
@@ -1849,6 +2166,11 @@ test "BPTree scan" {
 
     c = .{ .next = 1 };
     try std.testing.expectEqual(0, try t.scan("key00000002", "key00000002", &c, Check.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
+
+    // Equal bounds give no keys, also when the bound is a key in the tree.
+    c = .{ .next = 1 };
+    try std.testing.expectEqual(0, try t.scan("key00000003", "key00000003", &c, Check.visit));
     try std.testing.expectEqual(0, t.pool.pinned());
 
     // An error from visit stops the scan and releases all pins.
@@ -2000,7 +2322,7 @@ test "BPTree pool lock count" {
         for (kinds, &fewest) |kind, *f| {
             const odd = std.mem.eql(u8, kind, "put new");
             const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{20 * i + @intFromBool(odd)});
-            const before = t.pool.locks;
+            const before = t.pool.locks.raw;
             if (std.mem.eql(u8, kind, "get")) {
                 _ = try t.get(k, &out);
             } else if (std.mem.eql(u8, kind, "delete")) {
@@ -2008,8 +2330,9 @@ test "BPTree pool lock count" {
             } else {
                 try t.put(k, &val);
             }
-            f.* = @min(f.*, t.pool.locks - before);
+            f.* = @min(f.*, t.pool.locks.raw - before);
         }
     }
-    for (fewest) |f| try std.testing.expectEqual(2 * levels, f);
+    // Each pin of a page in the pool locks its partition one time. An unpin does not lock.
+    for (fewest) |f| try std.testing.expectEqual(levels, f);
 }
