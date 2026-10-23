@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const page_size = build_options.page_size;
 const pool_frames = build_options.pool_frames;
 const max_usage = build_options.max_usage;
+const ring_frames: usize = @min(256 * 1024 / page_size, pool_frames / 8);
 
 /// The maximum length of a key.
 pub const max_key = page_size / 16;
@@ -202,6 +203,11 @@ const Wal = struct {
     }
 };
 
+const Ring = struct {
+    slots: [@max(ring_frames, 1)]?usize = @splat(null),
+    current: usize = 0,
+};
+
 const table_parts = 128;
 
 const Partition = struct {
@@ -316,12 +322,16 @@ const Pool = struct {
         return part.map.get(pgno);
     }
 
-    fn pinFound(fr: *Frame) void {
+    fn pinFound(fr: *Frame, ring: bool) void {
         var s = fr.load();
         while (true) {
             var n = s;
             n.pins += 1;
-            if (n.usage < max_usage) n.usage += 1;
+            if (ring) {
+                n.usage = @max(n.usage, 1);
+            } else if (n.usage < max_usage) {
+                n.usage += 1;
+            }
             s = fr.cas(s, n) orelse return;
         }
     }
@@ -383,6 +393,19 @@ const Pool = struct {
         }
     }
 
+    fn fromRing(self: *Pool, ring: *Ring) ?usize {
+        ring.current = (ring.current + 1) % ring.slots.len;
+        const f = ring.slots[ring.current] orelse return null;
+        const fr = &self.frames[f];
+        var s = fr.load();
+        while (s.pins == 0 and s.usage <= 1) {
+            var n = s;
+            n.pins = 1;
+            s = fr.cas(s, n) orelse return f;
+        }
+        return null;
+    }
+
     fn writeVictim(self: *Pool, f: usize) !bool {
         const fr = &self.frames[f];
         var s = fr.load();
@@ -414,12 +437,26 @@ const Pool = struct {
         return true;
     }
 
-    fn victim(self: *Pool) !usize {
+    fn victim(self: *Pool, ring: ?*Ring) !usize {
         while (true) {
-            const f = try self.sweep();
+            var from_ring = false;
+            const f = blk: {
+                if (ring) |r| if (self.fromRing(r)) |f| {
+                    from_ring = true;
+                    break :blk f;
+                };
+                const f = try self.sweep();
+                if (ring) |r| r.slots[r.current] = f;
+                break :blk f;
+            };
             const fr = &self.frames[f];
             const s = fr.load();
             if (s.dirty) {
+                if (from_ring and fr.lsn.load(.acquire) > self.wal.durable.load(.acquire)) {
+                    ring.?.slots[ring.?.current] = null;
+                    _ = unpinFrame(fr, false);
+                    continue;
+                }
                 const written = self.writeVictim(f) catch |err| {
                     _ = unpinFrame(fr, false);
                     return err;
@@ -429,6 +466,7 @@ const Pool = struct {
                     continue;
                 }
             }
+
             if (s.mapped and !self.unmap(f)) {
                 _ = unpinFrame(fr, false);
                 continue;
@@ -462,19 +500,23 @@ const Pool = struct {
         return .{ .page = self.frameData(f), .pgno = fr.pgno.? };
     }
 
-    fn pin(self: *Pool, pgno: u32, mode: Load) !Page {
+    fn pin(self: *Pool, page: u32, mode: Load) !Page {
+        return self.pinWith(page, mode, null);
+    }
+
+    fn pinWith(self: *Pool, pgno: u32, mode: Load, ring: ?*Ring) !Page {
         std.debug.assert(pgno != meta_pgno);
         _ = self.lookups.fetchAdd(1, .monotonic);
         const part = self.partition(pgno);
         self.lockPart(part, .shared);
         if (part.map.get(pgno)) |f| {
-            pinFound(&self.frames[f]);
+            pinFound(&self.frames[f], ring != null);
             part.lock.unlockShared(self.io);
             return self.ready(f);
         }
         part.lock.unlockShared(self.io);
 
-        const v = try self.victim();
+        const v = try self.victim(ring);
         const fr = &self.frames[v];
         self.lockPart(part, .exclusive);
         const entry = part.map.getOrPutAssumeCapacity(pgno);
@@ -482,7 +524,7 @@ const Pool = struct {
             // another thread put the page in a frame while this one looked for a victime. the victim stays empty.
             _ = unpinFrame(fr, false);
             const f = entry.value_ptr.*;
-            pinFound(&self.frames[f]);
+            pinFound(&self.frames[f], ring != null);
             part.lock.unlock(self.io);
             return self.ready(f);
         }
@@ -747,6 +789,11 @@ pub const BPTree = struct {
     fn getPage(self: *BPTree, pgno: u32) !Page {
         if (pgno == meta_pgno or pgno >= @atomicLoad(u32, &self.npages, .monotonic)) return error.BadFile;
         return self.pool.pin(pgno, .load);
+    }
+
+    fn getPageWith(self: *BPTree, pgno: u32, ring: ?*Ring) !Page {
+        if (pgno == meta_pgno or pgno >= @atomicLoad(u32, &self.npages, .monotonic)) return error.BadFile;
+        return self.pool.pinWith(pgno, .load, ring);
     }
 
     fn pageAlloc(self: *BPTree, t: Page.Kind) !Page {
@@ -1159,6 +1206,8 @@ pub const BPTree = struct {
         var start: []const u8 = lo orelse "";
         var after: bool = false;
         var count: usize = 0;
+        var ring: Ring = .{};
+        const use_ring = build_options.scan_ring and ring_frames > 0 and @atomicLoad(u32, &self.npages, .monotonic) > pool_frames / 4;
 
         restart: while (true) {
             var op: Op = .{};
@@ -1181,7 +1230,7 @@ pub const BPTree = struct {
                 }
                 const next = leaf.link();
                 if (next == 0) return count;
-                const p = try self.getPage(next);
+                const p = try self.getPageWith(next, if (use_ring) &ring else null);
                 if (!self.pool.tryLatch(p, .shared)) {
                     self.pool.unpin(p, .clean);
                     if (leaf.count() > first) {
@@ -1759,6 +1808,124 @@ test Pool {
     try t.pool.flush();
 }
 
+/// A pin and unpin of page `pgno` by a scan with `ring`, with no I/O. Returns the frame.
+fn testRingPin(pool: *Pool, pgno: u32, ring: *Ring) !usize {
+    const p = try pool.pinWith(pgno, .no_load, ring);
+    defer pool.unpin(p, .clean);
+    return pool.frameIndex(p);
+}
+
+test "Pool ring" {
+    // With a max_usage of 1, a ring cannot see that another reader used one of its frames.
+    if (build_options.pool_paranoid or ring_frames < 2 or max_usage < 2) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
+    defer t.deinit(std.testing.allocator);
+    testEmptyPool(&t);
+    const pool = &t.pool;
+
+    // The first misses of a scan fill the ring from the clock sweep. Then the scan reuses the ring.
+    var ring: Ring = .{};
+    var used: [pool_frames]bool = @splat(false);
+    const moves = pool.hand.raw;
+    for (1..3 * ring_frames + 1) |pg| used[try testRingPin(pool, @intCast(pg), &ring)] = true;
+    try std.testing.expectEqual(ring_frames, std.mem.count(bool, &used, &.{true}));
+    for (ring.slots) |slot| try std.testing.expect(used[slot.?]);
+    try std.testing.expectEqual(ring_frames, pool.hand.raw - moves);
+
+    // A hit through the ring raises a usage count of 0 to 1, and no higher.
+    const pg: u32 = 3 * ring_frames;
+    const fr = &pool.frames[pool.find(pg).?];
+    testSetUsage(fr, 0);
+    _ = try testRingPin(pool, pg, &ring);
+    try std.testing.expectEqual(1, fr.load().usage);
+    _ = try testRingPin(pool, pg, &ring);
+    try std.testing.expectEqual(1, fr.load().usage);
+
+    // Another reader uses the page in the next slot. The scan does not take that frame:
+    // it gets a new frame the normal way, and the new frame takes the slot.
+    const next = (ring.current + 1) % ring_frames;
+    const other = ring.slots[next].?;
+    try testPin(pool, pool.frames[other].pgno.?);
+    const f = try testRingPin(pool, 100, &ring);
+    try std.testing.expect(f != other);
+    try std.testing.expectEqual(f, ring.slots[next].?);
+    try std.testing.expect(pool.frames[other].pgno != null);
+}
+
+test "Pool ring drops a frame whose write must force the log" {
+    if (build_options.pool_paranoid or ring_frames < 2) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(std.testing.io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(std.testing.io);
+    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
+    defer t.deinit(std.testing.allocator);
+    testEmptyPool(&t);
+    const pool = &t.pool;
+
+    var ring: Ring = .{};
+    for (1..ring_frames + 1) |pg| _ = try testRingPin(pool, @intCast(pg), &ring);
+    // The page in the next slot changes, and its log record is not on disk yet.
+    const next = (ring.current + 1) % ring_frames;
+    const f = ring.slots[next].?;
+    const pgno = pool.frames[f].pgno.?;
+    testSetDirty(&pool.frames[f], true);
+    pool.frames[f].lsn.store(try pool.wal.append(std.testing.io, &.{}, 0), .monotonic);
+
+    // The scan drops the frame from its ring and takes the frame in the slot after it. Nothing is written.
+    const writes = pool.writes.raw;
+    const g = try testRingPin(pool, 100, &ring);
+    try std.testing.expect(g != f);
+    try std.testing.expectEqual(null, ring.slots[next]);
+    try std.testing.expectEqual(pgno, pool.frames[f].pgno.?);
+    try std.testing.expect(pool.frames[f].load().dirty);
+    try std.testing.expectEqual(writes, pool.writes.raw);
+    // Leave the pool clean for deinit.
+    testSetDirty(&pool.frames[f], false);
+}
+
+test "BPTree large scan keeps a hot path in the pool" {
+    // A scan holds two leaves at a time, so a ring of one frame cannot reuse its frame.
+    if (build_options.pool_paranoid or !build_options.scan_ring or ring_frames < 2) return error.SkipZigTest;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit(std.testing.allocator);
+
+    var kbuf: [16]u8 = undefined;
+    var out: [max_val]u8 = undefined;
+    const val: [@min(100, max_val)]u8 = @splat('v');
+    var n: usize = 0;
+    while (t.npages < 4 * pool_frames) : (n += 1) {
+        try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{n}), &val);
+    }
+    const hot = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{n / 2});
+    for (0..3) |_| _ = (try t.get(hot, &out)).?;
+
+    // The scan reads every leaf, many more pages than the pool holds.
+    const Count = struct {
+        fn visit(_: void, _: []const u8, _: []const u8) !void {}
+    };
+    try std.testing.expectEqual(n, try t.scan(null, null, {}, Count.visit));
+    // The path of the hot key is still in the pool.
+    const reads = t.pool.reads.raw;
+    _ = (try t.get(hot, &out)).?;
+    try std.testing.expectEqual(reads, t.pool.reads.raw);
+}
+
 test "BPTree page alloc" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1807,6 +1974,13 @@ fn testEmptyPool(t: *BPTree) void {
     t.pool.frames = @splat(.{});
     for (&t.pool.table) |*part| part.map.clearRetainingCapacity();
     t.pool.hand.store(0, .monotonic);
+}
+
+/// Sets the dirty flag of a frame that no other thread uses.
+fn testSetDirty(fr: *Frame, dirty: bool) void {
+    var s = fr.load();
+    s.dirty = dirty;
+    fr.state.store(@bitCast(s), .monotonic);
 }
 
 /// Sets the usage count of a frame that no other thread uses.

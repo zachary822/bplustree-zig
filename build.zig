@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const page_size = b.option(usize, "page_size", "Size of b+ tree page.") orelse 4096;
     const pool_frames = b.option(usize, "pool_frames", "Size of b+ tree pool") orelse 16;
     const max_usage = b.option(u8, "max_usage", "Highest usage count of a frame") orelse 5;
+    const scan_ring = b.option(bool, "scan_ring", "Large scans read leaves through a ring of frames") orelse true;
     const pool_paranoid = b.option(bool, "paranoid", "Paranoid mode") orelse false;
     const disk_delay_us = b.option(u32, "disk_delay_us", "Sleep this long in every page read and write") orelse 0;
     const tsan = b.option(bool, "tsan", "Build with ThreadSanitizer") orelse false;
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(usize, "page_size", page_size);
     options.addOption(usize, "pool_frames", pool_frames);
     options.addOption(u8, "max_usage", max_usage);
+    options.addOption(bool, "scan_ring", scan_ring);
     options.addOption(bool, "pool_paranoid", pool_paranoid);
     options.addOption(u32, "disk_delay_us", disk_delay_us);
 
