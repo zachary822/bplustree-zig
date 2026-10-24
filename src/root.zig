@@ -11,7 +11,8 @@ const ring_frames: usize = @min(256 * 1024 / page_size, pool_frames / 8);
 /// The maximum length of a key.
 pub const max_key = page_size / 16;
 /// The maximum length of a value. A buffer of this size can hold all values that `get` returns.
-pub const max_val = page_size / 8;
+pub const max_val = std.math.maxInt(u32);
+pub const max_local = page_size / 8;
 const max_depth = 32;
 
 const hdr_size = 12;
@@ -19,13 +20,17 @@ const capacity = page_size - hdr_size;
 const min_fill = capacity / 4;
 /// The largest separator cell, with its slot, that a split sends to a parent.
 const max_sep = max_key + 6 + 2;
+/// fewest bytes of value that leaf cell keeps when there are overflow pages
+const min_local = page_size / 16;
+const ovfl_cap = page_size - hdr_size;
+const max_leaf_cell = 6 + max_key + max_local + 4;
 
 comptime {
     std.debug.assert(page_size >= 256 and page_size <= 32768);
 }
 
 const meta_pgno = 0;
-const magic = "BPTWAL01";
+const magic = "BPTOVF01";
 const meta_size = 32;
 const max_log_bytes = 10 << 20;
 
@@ -630,6 +635,7 @@ const Op = struct {
     changed: Stack(Page, max_changed) = .{},
     freed: Stack(Page, max_changed) = .{},
     lsn: u64 = 0,
+    old_chain: u32 = 0,
 
     fn owns(op: *const Op, p: Page) bool {
         for (op.held.items()[op.top..]) |h| if (h.page.page == p.page) return true;
@@ -646,6 +652,7 @@ const Op = struct {
 
 pub const BPTree = struct {
     pool: Pool,
+    gpa: Allocator,
     root: u32 = 0,
     npages: u32 = 0,
     freelist: u32 = 0,
@@ -659,12 +666,16 @@ pub const BPTree = struct {
     pub fn init(gpa: Allocator, io: Io, file: Io.File, log: Io.File) !BPTree {
         const mem = try gpa.alloc(u8, page_size * pool_frames);
         errdefer gpa.free(mem);
-        var t: BPTree = .{ .pool = .{ .io = io, .file = file, .wal = .{ .file = log }, .mem = mem } };
+        var t: BPTree = .{
+            .pool = .{ .io = io, .file = file, .wal = .{ .file = log }, .mem = mem },
+            .gpa = gpa,
+        };
         try t.pool.initTable(gpa);
         errdefer t.pool.deinitTable(gpa);
 
         if (try file.length(io) == 0) {
             try log.setLength(io, 0);
+            try log.sync(io);
             t.npages = 1;
             const root = try t.pageAlloc(.leaf);
             t.root = root.pgno;
@@ -686,6 +697,8 @@ pub const BPTree = struct {
     /// Writes all changed pages and the meta page, and then syncs the file.
     pub fn sync(self: *BPTree) !void {
         const io = self.pool.io;
+        // The log must be durable before a page reaches the file, as in `writeBack`.
+        try self.pool.wal.flushTo(io, self.pool.wal.end.load(.acquire));
         try self.pool.flush();
         try self.pool.file.sync(io);
         const epoch = self.pool.wal.epoch + 1;
@@ -694,6 +707,7 @@ pub const BPTree = struct {
         if (try self.pool.wal.file.length(io) > max_log_bytes)
             try self.pool.wal.file.setLength(io, 0);
         self.pool.wal.restart(epoch);
+        for (&self.pool.frames) |*fr| fr.lsn.store(0, .release);
     }
 
     fn metaWrite(self: *BPTree, epoch: u32) !void {
@@ -779,9 +793,21 @@ pub const BPTree = struct {
         const p = try self.getPage(pgno);
         defer self.pool.unpin(p, .clean);
         switch (p.kind()) {
-            .leaf => {},
+            .leaf => for (0..p.count()) |i| try self.markChain(seen, p.overflow(i)),
             .internal => for (0..p.count() + 1) |i| try self.markReachable(seen, p.child(i), depth + 1),
             else => return error.BadFile,
+        }
+    }
+
+    fn markChain(self: *BPTree, seen: []bool, first: u32) !void {
+        var pg = first;
+        while (pg != 0) {
+            if (pg == meta_pgno or pg >= self.npages or seen[pg]) return error.BadFile;
+            seen[pg] = true;
+            const p = try self.getPage(pg);
+            defer self.pool.unpin(p, .clean);
+            if (p.kind() != .overflow) return error.BadFile;
+            pg = p.link();
         }
     }
 
@@ -992,12 +1018,100 @@ pub const BPTree = struct {
         const leaf = path.leaf();
         const r = leaf.search(key);
         if (r.found) {
-            const val = leaf.leafVal(r.index);
-            if (out.len < val.len) return error.NoSpaceLeft;
-            @memcpy(out[0..val.len], val);
-            return out[0..val.len];
+            const len = leaf.valLen(r.index);
+            if (out.len < len) return error.NoSpaceLeft;
+            try self.readValue(leaf, r.index, out[0..len]);
+            return out[0..len];
         }
         return null;
+    }
+
+    pub fn getAlloc(self: *BPTree, gpa: Allocator, key: []const u8) !?[]u8 {
+        if (key.len > max_key) return error.KeyTooLarge;
+        var op: Op = .{};
+        const path = try self.descend(&op, key, .read);
+        defer self.releaseHeld(&op);
+        const leaf = path.leaf();
+        const r = leaf.search(key);
+        if (!r.found) return null;
+        const out = try gpa.alloc(u8, leaf.valLen(r.index));
+        errdefer gpa.free(out);
+        try self.readValue(leaf, r.index, out);
+        return out;
+    }
+
+    fn readValue(self: *BPTree, leaf: Page, i: usize, out: []u8) !void {
+        const local = leaf.localVal(i);
+        @memcpy(out[0..local.len], local);
+        var off = local.len;
+        var pg = leaf.overflow(i);
+        while (off < out.len) {
+            if (pg == 0) return error.BadFile;
+            const p = try self.getPage(pg);
+            defer self.pool.unpin(p, .clean);
+            if (p.kind() != .overflow) return error.BadFile;
+            const n = @min(ovfl_cap, out.len - off);
+            @memcpy(out[off..][0..n], p.page[hdr_size..][0..n]);
+            off += n;
+            pg = p.link();
+        }
+        if (pg != 0) return error.BadFile;
+    }
+
+    fn writeChain(self: *BPTree, rest: []const u8) !u32 {
+        std.debug.assert(rest.len > 0);
+        var prev = try self.pageAlloc(.overflow);
+        const first = prev.pgno;
+        var off: usize = 0;
+        while (true) {
+            const n = @min(ovfl_cap, rest.len - off);
+            @memcpy(prev.page[hdr_size..][0..n], rest[off..][0..n]);
+            off += n;
+            if (off < rest.len) {
+                const next = self.pageAlloc(.overflow) catch |err| {
+                    self.pool.unpin(prev, .dirty);
+                    self.freeChain(first, 0) catch {};
+                    return err;
+                };
+                prev.setLink(next.pgno);
+                self.logChainPage(prev);
+                prev = next;
+            } else {
+                self.logChainPage(prev);
+                return first;
+            }
+        }
+    }
+
+    fn freeChain(self: *BPTree, first: u32, lsn: u64) !void {
+        var pg = first;
+        while (pg != 0) {
+            const p = while (true) break self.getPage(pg) catch |err| switch (err) {
+                error.PoolExhausted => {
+                    std.Thread.yield() catch {};
+                    continue;
+                },
+                else => return err,
+            };
+            if (p.kind() != .overflow) {
+                self.pool.unpin(p, .clean);
+                return error.BadFile;
+            }
+            pg = p.link();
+            p.init(.free);
+            self.alloc_mu.lockUncancelable(self.pool.io);
+            p.setLink(self.freelist);
+            self.freelist = p.pgno;
+            self.alloc_mu.unlock(self.pool.io);
+            self.pool.unpin(p, .{ .logged = lsn });
+        }
+    }
+
+    fn logChainPage(self: *BPTree, p: Page) void {
+        const lsn = self.pool.wal.append(self.pool.io, &.{p}, 0) catch |err| {
+            std.debug.panic("chain: cannot write the log: {t}", .{err});
+        };
+        self.pool.unpin(p, .{ .logged = lsn });
     }
 
     /// true if split. The caller holds the path and reserves the new pages.
@@ -1048,7 +1162,7 @@ pub const BPTree = struct {
         return true;
     }
 
-    fn putIn(self: *BPTree, op: *Op, key: []const u8, val: []const u8, how: Descent) !bool {
+    fn putIn(self: *BPTree, op: *Op, key: []const u8, cell: []const u8, how: Descent) !bool {
         var path = try self.descend(op, key, how);
         defer self.finish(op);
         const leaf = path.leaf();
@@ -1056,7 +1170,7 @@ pub const BPTree = struct {
 
         const r = leaf.search(key);
         const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
-        const new_sz = 4 + key.len + val.len + 2;
+        const new_sz = cell.len + 2;
         const splits = leaf.freeBytes() + old_sz < new_sz;
         const underflows = r.found and !splits and leaf.usedBytes() - old_sz + new_sz < min_fill;
         if (!splits and !underflows) {
@@ -1071,11 +1185,11 @@ pub const BPTree = struct {
 
         // Nothing below can fail, so the tree changes completely or not at all.
         if (r.found) {
+            op.old_chain = leaf.overflow(r.index);
             leaf.deleteCell(r.index);
             self.changed(op, leaf);
         }
-        var c: [4 + max_key + max_val]u8 = undefined;
-        const split = self.insertUp(op, path.slice(), path.depth, r.index, makeLeafCell(&c, key, val));
+        const split = self.insertUp(op, path.slice(), path.depth, r.index, cell);
         std.debug.assert(split == splits);
         if (r.found and !split)
             self.rebalance(op, path.slice(), path.depth);
@@ -1085,10 +1199,22 @@ pub const BPTree = struct {
     pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
+        const local = localSize(val.len);
+        const first = if (local < val.len) try self.writeChain(val[local..]) else 0;
+        var c: [max_leaf_cell]u8 = undefined;
+        const cell = if (first == 0) makeLeafCell(&c, key, val) else makeOverflowCell(&c, key, val.len, val[0..local], first);
         var op: Op = .{};
-        if (!try self.putIn(&op, key, val, .optimistic))
-            _ = try self.putIn(&op, key, val, .write);
+        self.putCell(&op, key, cell) catch |err| {
+            if (first != 0) try self.freeChain(first, 0);
+            return err;
+        };
+        if (op.old_chain != 0) try self.freeChain(op.old_chain, op.lsn);
         if (self.durable) try self.pool.wal.flushTo(self.pool.io, op.lsn);
+    }
+
+    fn putCell(self: *BPTree, op: *Op, key: []const u8, cell: []const u8) !void {
+        if (!try self.putIn(op, key, cell, .optimistic))
+            _ = try self.putIn(op, key, cell, .write);
     }
 
     /// The caller holds the path and the siblings, and reserves the new pages.
@@ -1178,7 +1304,7 @@ pub const BPTree = struct {
             self.releaseAbove(op);
         }
 
-        // Nothing below can fail, so the tree changes completely or not at all.
+        op.old_chain = leaf.overflow(r.index);
         leaf.deleteCell(r.index);
         self.changed(op, leaf);
         self.rebalance(op, path.slice(), path.depth);
@@ -1189,6 +1315,7 @@ pub const BPTree = struct {
         if (key.len > max_key) return error.KeyTooLarge;
         var op: Op = .{};
         const found = try self.deleteIn(&op, key, .optimistic) orelse (try self.deleteIn(&op, key, .write)).?;
+        if (op.old_chain != 0) try self.freeChain(op.old_chain, op.lsn);
         if (self.durable) try self.pool.wal.flushTo(self.pool.io, op.lsn);
         return found;
     }
@@ -1207,6 +1334,8 @@ pub const BPTree = struct {
         var after: bool = false;
         var count: usize = 0;
         var ring: Ring = .{};
+        var big: []u8 = &.{};
+        defer self.gpa.free(big);
         const use_ring = build_options.scan_ring and ring_frames > 0 and @atomicLoad(u32, &self.npages, .monotonic) > pool_frames / 4;
 
         restart: while (true) {
@@ -1225,7 +1354,18 @@ pub const BPTree = struct {
                 for (i..leaf.count()) |j| {
                     const k = leaf.cellKey(j);
                     if (hi) |h| if (!std.mem.lessThan(u8, k, h)) return count;
-                    try visit(ctx, k, leaf.leafVal(j));
+                    // try visit(ctx, k, leaf.localVal(j));
+                    const val = if (leaf.overflow(j) == 0) leaf.localVal(j) else blk: {
+                        const len = leaf.valLen(j);
+                        if (big.len < len) {
+                            self.gpa.free(big);
+                            big = &.{};
+                            big = try self.gpa.alloc(u8, len);
+                        }
+                        try self.readValue(leaf, j, big[0..len]);
+                        break :blk big[0..len];
+                    };
+                    try visit(ctx, k, val);
                     count += 1;
                 }
                 const next = leaf.link();
@@ -1301,6 +1441,7 @@ pub const BPTree = struct {
                 if (st.next_leaf != null and st.next_leaf != pgno)
                     return checkFail("the leaf before {d} links to {d}", .{ pgno, st.next_leaf.? });
                 st.next_leaf = p.link();
+                for (0..n) |i| try self.checkChain(st, p.overflow(i), p.valLen(i) - p.localVal(i).len);
             },
             .internal => {
                 if (n == 0)
@@ -1313,6 +1454,23 @@ pub const BPTree = struct {
             },
             else => return checkFail("page {d} has type {d}", .{ pgno, @backingInt(p.kind()) }),
         }
+    }
+
+    fn checkChain(self: *BPTree, st: *CheckState, first: u32, rest: usize) !void {
+        var pg = first;
+        var left = rest;
+        while (left > 0) {
+            if (pg == 0) return checkFail("a chain ends {d} bytes earl", .{left});
+            if (pg == meta_pgno or pg >= self.npages or st.seen[pg])
+                return checkFail("overflow page {d} is out of range or seen twice", .{pg});
+            st.seen[pg] = true;
+            const p = try self.getPage(pg);
+            defer self.pool.unpin(p, .clean);
+            if (p.kind() != .overflow) return checkFail("page {d} is in a chain but has type {d}", .{ pg, @backingInt(p.kind()) });
+            left -= @min(left, ovfl_cap);
+            pg = p.link();
+        }
+        if (pg != 0) return checkFail("a chain is longer than its value", .{});
     }
 };
 
@@ -1335,6 +1493,7 @@ const Page = struct {
         free = 0,
         leaf = 1,
         internal = 2,
+        overflow = 3,
         _,
     };
 
@@ -1381,7 +1540,7 @@ const Page = struct {
         put16(self.page[hdr_size + 2 * i ..], @intCast(off));
     }
     fn cellSize(self: Page, c: []const u8) usize {
-        if (self.kind() == .leaf) return 4 + @as(usize, get16(c)) + get16(c[2..]);
+        if (self.kind() == .leaf) return leafCellSize(get16(c), get32(c[2..]));
         return 6 + @as(usize, get16(c[4..]));
     }
     fn cell(self: Page, i: usize) []const u8 {
@@ -1392,16 +1551,24 @@ const Page = struct {
         const c = self.cell(i);
         if (self.kind() == .leaf) {
             const klen = get16(c);
-            return c[4..][0..klen];
+            return c[6..][0..klen];
         } else {
             const klen = get16(c[4..]);
             return c[6..][0..klen];
         }
     }
-    fn leafVal(self: Page, i: usize) []const u8 {
+
+    fn valLen(self: Page, i: usize) u32 {
+        return get32(self.cell(i)[2..]);
+    }
+    fn localVal(self: Page, i: usize) []const u8 {
         const c = self.cell(i);
-        const vlen = get16(c[2..4]);
-        return c[4 + get16(c) ..][0..vlen];
+        return c[6 + get16(c) ..][0..localSize(get32(c[2..]))];
+    }
+    fn overflow(self: Page, i: usize) u32 {
+        const c = self.cell(i);
+        if (get32(c[2..]) <= max_local) return 0;
+        return get32(c[c.len - 4 ..]);
     }
 
     fn child(self: Page, i: usize) u32 {
@@ -1497,12 +1664,34 @@ const Page = struct {
     }
 };
 
+fn localSize(vlen: usize) usize {
+    if (vlen <= max_local) return vlen;
+    const k = min_local + (vlen - min_local) % ovfl_cap;
+    return if (k <= max_local) k else min_local;
+}
+
+fn leafCellSize(klen: usize, vlen: usize) usize {
+    const ptr: usize = if (vlen > max_local) 4 else 0;
+    return 6 + klen + localSize(vlen) + ptr;
+}
+
 fn makeLeafCell(out: []u8, k: []const u8, v: []const u8) []u8 {
+    std.debug.assert(v.len <= max_local);
     put16(out, @intCast(k.len));
-    put16(out[2..], @intCast(v.len));
-    @memcpy(out[4..][0..k.len], k);
-    @memcpy(out[4 + k.len ..][0..v.len], v);
-    return out[0 .. 4 + k.len + v.len];
+    put32(out[2..], @intCast(v.len));
+    @memcpy(out[6..][0..k.len], k);
+    @memcpy(out[6 + k.len ..][0..v.len], v);
+    return out[0 .. 6 + k.len + v.len];
+}
+
+fn makeOverflowCell(out: []u8, k: []const u8, vlen: usize, local: []const u8, first: u32) []u8 {
+    std.debug.assert(vlen > max_local and local.len == localSize(vlen) and first != 0);
+    put16(out, @intCast(k.len));
+    put32(out[2..], @intCast(vlen));
+    @memcpy(out[6..][0..k.len], k);
+    @memcpy(out[6 + k.len ..][0..local.len], local);
+    put32(out[6 + k.len + local.len ..], first);
+    return out[0 .. 6 + k.len + local.len + 4];
 }
 
 fn makeInternalCell(out: []u8, child_pg: u32, k: []const u8) []u8 {
@@ -1596,7 +1785,7 @@ test "BPTree sync and reopen" {
     defer tmp.cleanup();
 
     var kbuf: [16]u8 = undefined;
-    var out: [max_val]u8 = undefined;
+    var out: [max_local]u8 = undefined;
     const N = 500;
     const file = try createTestFile(tmp.dir);
     defer file.close(std.testing.io);
@@ -1627,7 +1816,7 @@ test "BPTree recovers after a crash" {
     defer log.close(io);
 
     var kbuf: [16]u8 = undefined;
-    var out: [max_val]u8 = undefined;
+    var out: [max_local]u8 = undefined;
     const N = 2000;
     {
         var t: BPTree = try .init(std.testing.allocator, io, file, log);
@@ -1647,6 +1836,91 @@ test "BPTree recovers after a crash" {
     }
 }
 
+test "BPTree recovers values with chains after a crash" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+
+    const N = 60;
+    const lens = [_]usize{ 20, max_local + 1, 2 * ovfl_cap + 7 };
+    const vbuf = try gpa.alloc(u8, lens[2]);
+    defer gpa.free(vbuf);
+    const out = try gpa.alloc(u8, lens[2]);
+    defer gpa.free(out);
+    var kbuf: [16]u8 = undefined;
+    {
+        var t: BPTree = try .init(gpa, io, file, log);
+        defer t.deinit(gpa);
+        for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, lens[i % 3], 1));
+        try t.sync();
+        // After the sync: replace a third, delete a third. Old chains go to the free list, new chains come from it.
+        for (0..N) |i| {
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
+            if (i % 3 == 0) try t.put(k, testValue(vbuf, lens[(i + 2) % 3], 2));
+            if (i % 3 == 1) _ = try t.delete(k);
+        }
+        // An orphan chain: the crash came after its pages were logged, but before the put of its cell.
+        _ = try t.writeChain(testValue(vbuf, lens[2], 9));
+        // No sync: deinit drops the pool, as a crash would.
+    }
+    var t: BPTree = try .init(gpa, io, file, log);
+    defer t.deinit(gpa);
+    // The orphan chain is on the free list, and no page of a live chain is.
+    try t.check(gpa);
+    for (0..N) |i| {
+        const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), out);
+        switch (i % 3) {
+            0 => try std.testing.expectEqualSlices(u8, testValue(vbuf, lens[(i + 2) % 3], 2), got.?),
+            1 => try std.testing.expectEqual(null, got),
+            else => try std.testing.expectEqualSlices(u8, testValue(vbuf, lens[i % 3], 1), got.?),
+        }
+    }
+}
+
+test "BPTree freed chain page waits for the commit that freed it" {
+    if (build_options.pool_paranoid) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+    var t: BPTree = try .init(gpa, io, file, log);
+    defer t.deinit(gpa);
+
+    const big: [2 * ovfl_cap]u8 = @splat('b');
+    try t.put("k", &big);
+    try t.sync();
+    var op: Op = .{};
+    const path = try t.descend(&op, "k", .read);
+    const old = path.leaf().overflow(0);
+    t.releaseHeld(&op);
+
+    // The replace frees the old chain. Its commit is in the log, but not durable.
+    t.durable = false;
+    try t.put("k", "small");
+    try std.testing.expect(t.pool.wal.end.raw > t.pool.wal.durable.raw);
+    // The two pages of the old chain are at the head of the free list, the second page first.
+    // An eviction of either must first make the commit durable, so each carries the LSN of the commit.
+    const second = t.freelist;
+    for ([_]u32{ old, second }) |pg| {
+        try std.testing.expectEqual(t.pool.wal.end.raw, t.pool.frames[t.pool.find(pg).?].lsn.raw);
+        const p = try t.getPage(pg);
+        defer t.pool.unpin(p, .clean);
+        try std.testing.expectEqual(.free, p.kind());
+        if (pg == second) try std.testing.expectEqual(old, p.link());
+    }
+    try t.check(gpa);
+    try t.sync();
+}
+
 test "BPTree recovery ignores an operation that did not commit" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1657,7 +1931,7 @@ test "BPTree recovery ignores an operation that did not commit" {
     defer log.close(io);
 
     var kbuf: [16]u8 = undefined;
-    var out: [max_val]u8 = undefined;
+    var out: [max_local]u8 = undefined;
     const N = 500;
     {
         var t: BPTree = try .init(std.testing.allocator, io, file, log);
@@ -1748,7 +2022,7 @@ test Page {
     try std.testing.expectEqual(4, leaf.count());
     try std.testing.expectEqualStrings("alpha", leaf.cellKey(0));
     try std.testing.expectEqualStrings("delta", leaf.cellKey(3));
-    try std.testing.expectEqualStrings("value", leaf.leafVal(2));
+    try std.testing.expectEqualStrings("value", leaf.localVal(2));
 
     const r = leaf.search("alpha");
     try std.testing.expect(r.found);
@@ -1780,6 +2054,49 @@ test Page {
     try std.testing.expectEqual(7, internal.child(0));
     try std.testing.expectEqual(9, internal.child(1));
     try std.testing.expectEqualStrings("mid", internal.cellKey(0));
+}
+
+test localSize {
+    // A value up to max_local stays whole. One byte more, and the cell keeps only min_local bytes.
+    try std.testing.expectEqual(0, localSize(0));
+    try std.testing.expectEqual(max_local, localSize(max_local));
+    try std.testing.expectEqual(min_local, localSize(max_local + 1));
+    // 10 bytes more than min_local plus one full page: the cell keeps the 10 bytes, so the page is full.
+    try std.testing.expectEqual(min_local + 10, localSize(min_local + ovfl_cap + 10));
+    // In all cases the cell keeps min_local to max_local bytes, and the overflow pages are full or the cell keeps min_local.
+    for (max_local + 1..max_local + 3 * ovfl_cap) |vlen| {
+        const local = localSize(vlen);
+        try std.testing.expect(local >= min_local and local <= max_local);
+        try std.testing.expect((vlen - local) % ovfl_cap == 0 or local == min_local);
+    }
+}
+
+test "Page leaf cell with overflow" {
+    var buf: [page_size]u8 = undefined;
+    var cell: [max_leaf_cell]u8 = undefined;
+    const leaf: Page = .{ .page = &buf };
+    leaf.init(.leaf);
+
+    const vlen = 3 * ovfl_cap;
+    const local: [localSize(vlen)]u8 = @splat('L');
+    const c = makeOverflowCell(&cell, "big", vlen, &local, 77);
+    try std.testing.expectEqual(leafCellSize(3, vlen), c.len);
+    try std.testing.expect(leaf.insertCell(0, makeLeafCell(cell[c.len..], "a", "small")));
+    try std.testing.expect(leaf.insertCell(1, c));
+
+    try std.testing.expectEqualStrings("a", leaf.cellKey(0));
+    try std.testing.expectEqual(5, leaf.valLen(0));
+    try std.testing.expectEqualStrings("small", leaf.localVal(0));
+    try std.testing.expectEqual(0, leaf.overflow(0));
+
+    try std.testing.expectEqualStrings("big", leaf.cellKey(1));
+    try std.testing.expectEqual(vlen, leaf.valLen(1));
+    try std.testing.expectEqualStrings(&local, leaf.localVal(1));
+    try std.testing.expectEqual(77, leaf.overflow(1));
+    // The pointer moves with the cell.
+    leaf.deleteCell(0);
+    leaf.compact();
+    try std.testing.expectEqual(77, leaf.overflow(0));
 }
 
 test Pool {
@@ -1906,8 +2223,8 @@ test "BPTree large scan keeps a hot path in the pool" {
     defer t.deinit(std.testing.allocator);
 
     var kbuf: [16]u8 = undefined;
-    var out: [max_val]u8 = undefined;
-    const val: [@min(100, max_val)]u8 = @splat('v');
+    var out: [max_local]u8 = undefined;
+    const val: [@min(100, max_local)]u8 = @splat('v');
     var n: usize = 0;
     while (t.npages < 4 * pool_frames) : (n += 1) {
         try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{n}), &val);
@@ -2154,7 +2471,7 @@ test "BPTree get" {
     t.pool.unpin(right, .dirty);
     t.pool.unpin(root, .dirty);
 
-    var buf: [max_val]u8 = undefined;
+    var buf: [max_local]u8 = undefined;
     try std.testing.expectEqualStrings("1", (try t.get("a", &buf)).?);
     try std.testing.expectEqualStrings("2", (try t.get("m", &buf)).?);
     try std.testing.expectEqualStrings("3", (try t.get("z", &buf)).?);
@@ -2192,7 +2509,7 @@ test CellList {
     var cl: CellList = .{};
     cl.addPage(p);
     try std.testing.expectEqual(4, cl.cells.len);
-    try std.testing.expectEqual(4 * (4 + 1 + 5 + 2), cl.bytes(0, cl.cells.len));
+    try std.testing.expectEqual(4 * (6 + 1 + 5 + 2), cl.bytes(0, cl.cells.len));
 
     // The list keeps copies, so a change to the page does not change the list.
     p.init(.leaf);
@@ -2234,7 +2551,7 @@ test "BPTree put get delete" {
 
     var kbuf: [16]u8 = undefined;
     var vbuf: [32]u8 = undefined;
-    var out: [max_val]u8 = undefined;
+    var out: [max_local]u8 = undefined;
 
     for (order) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
@@ -2282,6 +2599,161 @@ test "BPTree put get delete" {
     defer t.pool.unpin(root, .clean);
     try std.testing.expectEqual(.leaf, root.kind());
     try std.testing.expectEqual(0, root.count());
+}
+
+/// A value of `len` bytes that depends on `seed`, so a test can tell values apart and see where one goes wrong.
+fn testValue(buf: []u8, len: usize, seed: u8) []u8 {
+    for (buf[0..len], 0..) |*b, i| b.* = @truncate(i *% 31 +% i / ovfl_cap +% seed);
+    return buf[0..len];
+}
+
+test "BPTree large values" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+
+    // Lengths around each edge, and one chain longer than the pool.
+    const lens = [_]usize{ 0, 1, max_local, max_local + 1, min_local + ovfl_cap, min_local + ovfl_cap + 1, 3 * ovfl_cap, (pool_frames + 3) * ovfl_cap + 5 };
+    const vbuf = try gpa.alloc(u8, lens[lens.len - 1]);
+    defer gpa.free(vbuf);
+    const out = try gpa.alloc(u8, lens[lens.len - 1]);
+    defer gpa.free(out);
+    var kbuf: [16]u8 = undefined;
+    {
+        var t: BPTree = try .init(gpa, io, file, log);
+        defer t.deinit(gpa);
+        for (lens, 0..) |len, i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, len, @intCast(i)));
+        try t.check(gpa);
+        // Each chain has just enough pages: the root leaf and the chains are all the pages of the tree.
+        var chain_pages: usize = 0;
+        for (lens) |len| chain_pages += std.math.divCeil(usize, len - localSize(len), ovfl_cap) catch unreachable;
+        try std.testing.expectEqual(2 + chain_pages, t.npages);
+        try t.sync();
+    }
+    // A new tree reads all pages from the file.
+    var t: BPTree = try .init(gpa, io, file, log);
+    defer t.deinit(gpa);
+    for (lens, 0..) |len, i| {
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
+        const want = testValue(vbuf, len, @intCast(i));
+        try std.testing.expectEqualSlices(u8, want, (try t.get(k, out)).?);
+        const got = (try t.getAlloc(gpa, k)).?;
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, want, got);
+        if (len > 0) try std.testing.expectError(error.NoSpaceLeft, t.get(k, out[0 .. len - 1]));
+    }
+    try std.testing.expectEqual(null, try t.getAlloc(gpa, "nokey"));
+
+    const Check = struct {
+        lens: []const usize,
+        buf: []u8,
+        n: usize = 0,
+        fn visit(c: *@This(), _: []const u8, val: []const u8) !void {
+            try std.testing.expectEqualSlices(u8, testValue(c.buf, c.lens[c.n], @intCast(c.n)), val);
+            c.n += 1;
+        }
+    };
+    var c: Check = .{ .lens = &lens, .buf = vbuf };
+    try std.testing.expectEqual(lens.len, try t.scan(null, null, &c, Check.visit));
+    try std.testing.expectEqual(0, t.pool.pinned());
+}
+
+test "BPTree replace and delete free chains" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+    var t: BPTree = try .init(gpa, io, file, log);
+    defer t.deinit(gpa);
+
+    const lens = [_]usize{ 10, max_local + 1, 2 * ovfl_cap, 5 * ovfl_cap };
+    const vbuf = try gpa.alloc(u8, lens[lens.len - 1]);
+    defer gpa.free(vbuf);
+    const out = try gpa.alloc(u8, lens[lens.len - 1]);
+    defer gpa.free(out);
+    var kbuf: [16]u8 = undefined;
+    const keys = 20;
+
+    // All keys get the longest value first. Then a replace frees the old chain after it writes the new one,
+    // so the file grows by one chain at most, however many times the values change.
+    for (0..keys) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, lens[3], 0));
+    const npages = t.npages;
+    var prng: std.Random.DefaultPrng = .init(1);
+    var cur: [keys]usize = @splat(3);
+    for (1..20) |round| {
+        for (0..keys) |i| {
+            cur[i] = prng.random().uintLessThan(usize, lens.len);
+            try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, lens[cur[i]], @intCast(round)));
+        }
+        try t.check(gpa);
+        for (0..keys) |i| {
+            const got = (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), out)).?;
+            try std.testing.expectEqualSlices(u8, testValue(vbuf, lens[cur[i]], @intCast(round)), got);
+        }
+    }
+    try std.testing.expect(t.npages <= npages + 5 + 2);
+
+    // After the deletes, every page but the root leaf is on the free list.
+    for (0..keys) |i| try std.testing.expect(try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i})));
+    try t.check(gpa);
+    var free: usize = 0;
+    var pg = t.freelist;
+    while (pg != 0) : (free += 1) {
+        const p = try t.getPage(pg);
+        defer t.pool.unpin(p, .clean);
+        pg = p.link();
+    }
+    try std.testing.expectEqual(t.npages - 2, free);
+}
+
+test "BPTree failed put frees its new chain" {
+    if (pool_frames < 4) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer log.close(io);
+    var t: BPTree = try .init(gpa, io, file, log);
+    defer t.deinit(gpa);
+
+    // Fill the root leaf with small values, so that the cell of the big value splits it.
+    const huge: [3 * ovfl_cap]u8 = @splat('h');
+    var kbuf: [16]u8 = undefined;
+    var out: [max_local]u8 = undefined;
+    const val: [8]u8 = @splat('v');
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        const root = try t.getPage(t.root);
+        const full = root.freeBytes() < leafCellSize(3, huge.len) + 2;
+        t.pool.unpin(root, .clean);
+        if (full) break;
+        try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{n}), &val);
+    }
+
+    // Leave two frames free: enough to write a chain, but not enough for the root, the new leaf and the new root.
+    var pinned: [pool_frames]Page = undefined;
+    for (pinned[0 .. pool_frames - 2], 0..) |*p, i| p.* = try t.pool.pin(@intCast(1000 + i), .no_load);
+    const npages = t.npages;
+    try std.testing.expectError(error.PoolExhausted, t.put("zzz", &huge));
+    for (pinned[0 .. pool_frames - 2]) |p| t.pool.unpin(p, .clean);
+
+    // The chain was written: the file grew. Its pages are on the free list, and the tree is as it was.
+    try std.testing.expect(t.npages >= npages + 3);
+    try t.check(gpa);
+    try std.testing.expectEqual(null, try t.get("zzz", &out));
+    for (0..n) |i| try std.testing.expectEqualStrings(&val, (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out)).?);
 }
 
 test "BPTree scan" {
@@ -2371,8 +2843,8 @@ test "BPTree failed operation does not change the tree" {
     defer t.deinit(std.testing.allocator);
 
     var kbuf: [16]u8 = undefined;
-    var out: [max_val]u8 = undefined;
-    const big: [max_val]u8 = @splat('v');
+    var out: [max_local]u8 = undefined;
+    const big: [max_local]u8 = @splat('v');
 
     var n: usize = 0;
     while (t.npages < 2 * pool_frames + 2 * max_depth) : (n += 1) {
@@ -2480,7 +2952,7 @@ test "BPTree pool lock count" {
     t.durable = false;
 
     var kbuf: [16]u8 = undefined;
-    var out: [max_val]u8 = undefined;
+    var out: [max_local]u8 = undefined;
     const val: [8]u8 = @splat('v');
     // The even keys are in the tree. Most puts of an odd key do not split.
     for (0..2000) |k| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{2 * k}), &val);

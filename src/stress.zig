@@ -16,6 +16,8 @@ const hot_runs = 4;
 const hot_len = 16;
 /// The number of keys in one scan of `scanmix`.
 const scan_len = 1000;
+/// The longest value of the test: three pages, so that its chain has up to three overflow pages.
+const max_test_val = 24 * bpt.max_local;
 /// A run that takes longer than this has hung.
 const timeout_s = 600;
 
@@ -23,14 +25,17 @@ fn keyOf(buf: *[16]u8, k: usize) []const u8 {
     return std.fmt.bufPrint(buf, "key{d:0>8}", .{k}) catch unreachable;
 }
 
-/// The length of version `ver` of the value of key `k`: from 8 bytes up to `max_val`.
+/// The length of version `ver` of the value of key `k`: from 8 bytes up to `bpt.max_local`,
+/// or for one version in four, up to `max_test_val`, so that most of those have a chain.
 fn valLen(k: usize, ver: u32) usize {
-    return 8 + (k *% 7919 +% @as(usize, ver) *% 104729) % (bpt.max_val - 8 + 1);
+    const h = k *% 7919 +% @as(usize, ver) *% 104729;
+    const max: usize = if (h % 4 == 0) max_test_val else bpt.max_local;
+    return 8 + (h / 4) % (max - 8 + 1);
 }
 
 /// A value says which key and version it belongs to, and then repeats one byte that depends on both.
 /// A reader can check any value it gets, so it notices a value torn by a writer.
-fn makeVal(buf: *[bpt.max_val]u8, k: usize, ver: u32) []const u8 {
+fn makeVal(buf: *[max_test_val]u8, k: usize, ver: u32) []const u8 {
     const v = buf[0..valLen(k, ver)];
     std.mem.writeInt(u32, v[0..4], @intCast(k), .little);
     std.mem.writeInt(u32, v[4..8], ver, .little);
@@ -115,8 +120,8 @@ fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
     var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
     var kbuf: [16]u8 = undefined;
-    var vbuf: [bpt.max_val]u8 = undefined;
-    var out: [bpt.max_val]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    var out: [max_test_val]u8 = undefined;
     const owned = (test_keys - id + sh.threads - 1) / sh.threads;
 
     for (0..sh.ops) |_| {
@@ -179,8 +184,8 @@ fn benchWorker(sh: *Shared, id: usize, seed: u64) !void {
     var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
     var kbuf: [16]u8 = undefined;
-    var vbuf: [bpt.max_val]u8 = undefined;
-    var out: [bpt.max_val]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    var out: [max_test_val]u8 = undefined;
     @memset(&vbuf, 'v');
 
     for (0..sh.ops) |_| {
@@ -207,7 +212,7 @@ fn scanmix(t: *bpt.BPTree, io: Io, scan_pct: usize, update_pct: usize, ops: usiz
     const rand = prng.random();
     var kbuf: [16]u8 = undefined;
     var hbuf: [16]u8 = undefined;
-    var out: [bpt.max_val]u8 = undefined;
+    var out: [max_test_val]u8 = undefined;
     const Count = struct {
         fn visit(_: void, _: []const u8, _: []const u8) !void {}
     };
@@ -310,7 +315,7 @@ fn crashWorker(t: *bpt.BPTree, id: usize, seed: u64) void {
     var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
     var kbuf: [16]u8 = undefined;
-    var vbuf: [bpt.max_val]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
     while (true) {
         const k = id + crash_threads * rand.uintLessThan(usize, test_keys / crash_threads);
         const key = keyOf(&kbuf, k);
@@ -329,7 +334,7 @@ fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !
     const f: Files = try .open(io, path, true);
     var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
     var kbuf: [16]u8 = undefined;
-    var vbuf: [bpt.max_val]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
     t.durable = false;
     for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
     try t.sync();
@@ -397,8 +402,8 @@ pub fn main(init: std.process.Init) !void {
         @memset(sh.vers, 0);
 
         var kbuf: [16]u8 = undefined;
-        var vbuf: [bpt.max_val]u8 = undefined;
-        var out: [bpt.max_val]u8 = undefined;
+        var vbuf: [max_test_val]u8 = undefined;
+        var out: [max_test_val]u8 = undefined;
         for (0..rounds) |round| {
             try run(testWorker, &sh, 1 + round * 1000);
             // Every thread has stopped, so the tree must be whole and hold exactly what the writers put.
