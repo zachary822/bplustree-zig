@@ -811,6 +811,88 @@ pub const BPTree = struct {
         }
     }
 
+    pub const VacuumMode = union(enum) {
+        truncate,
+    };
+
+    pub const VacuumStats = struct {
+        before: u32,
+        after: u32,
+        moved: u32,
+    };
+
+    pub fn vacuum(self: *BPTree, mode: VacuumMode) !VacuumStats {
+        const before = self.npages;
+        const free = try self.gpa.alloc(bool, before);
+        defer self.gpa.free(free);
+        const list = try self.gpa.alloc(u32, before);
+        defer self.gpa.free(list);
+        const nfree = try self.markFree(free, list);
+        const moved: u32 = switch (mode) {
+            .truncate => 0,
+        };
+        try self.shrink(free, list[0..nfree]);
+        try self.truncateFile();
+        return .{ .before = before, .after = self.npages, .moved = moved };
+    }
+
+    fn markFree(self: *BPTree, free: []bool, list: []u32) !usize {
+        @memset(free, false);
+        var n: usize = 0;
+        var pg = self.freelist;
+        while (pg != 0) : (n += 1) {
+            if (pg >= free.len or free[pg]) return error.BadFile;
+            free[pg] = true;
+            list[n] = pg;
+            const p = try self.getPage(pg);
+            defer self.pool.unpin(p, .clean);
+            if (p.kind() != .free) return error.BadFile;
+            pg = p.link();
+        }
+        return n;
+    }
+
+    fn shrink(self: *BPTree, free: []const bool, list: []const u32) !void {
+        var end: u32 = @intCast(free.len);
+        while (end > 1 and free[end - 1]) end -= 1;
+        if (end == free.len) return;
+        try self.relinkFree(free, list, end);
+        @atomicStore(u32, &self.npages, end, .monotonic);
+        try self.sync();
+    }
+
+    fn relinkFree(self: *BPTree, free: []const bool, list: []const u32, end: u32) !void {
+        const lsn = self.pool.wal.append(self.pool.io, &.{}, 0) catch |err|
+            std.debug.panic("vacuum: cannot write the log: {t}", .{err});
+        self.freelist = 0;
+        var prev: ?usize = null;
+        var kept: usize = 0;
+        for (list, 0..) |pg, i| {
+            if (pg >= end or !free[pg]) continue;
+            if (prev) |j| {
+                if (j + 1 != i) try self.setFreeLink(list[j], pg, lsn);
+            } else self.freelist = pg;
+            prev = i;
+            kept += 1;
+        }
+        if (prev) |j| if (j + 1 != list.len) try self.setFreeLink(list[j], 0, lsn);
+        std.debug.assert(kept == std.mem.count(bool, free[0..end], &.{true}));
+    }
+
+    fn setFreeLink(self: *BPTree, pgno: u32, next: u32, lsn: u64) !void {
+        const p = try self.getPage(pgno);
+        p.setLink(next);
+        self.pool.unpin(p, .{ .logged = lsn });
+    }
+
+    fn truncateFile(self: *BPTree) !void {
+        const io = self.pool.io;
+        const len = @as(u64, self.npages) * page_size;
+        if (try self.pool.file.length(io) <= len) return;
+        try self.pool.file.setLength(io, len);
+        try self.pool.file.sync(io);
+    }
+
     /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
     fn getPage(self: *BPTree, pgno: u32) !Page {
         if (pgno == meta_pgno or pgno >= @atomicLoad(u32, &self.npages, .monotonic)) return error.BadFile;
@@ -2981,4 +3063,92 @@ test "BPTree pool lock count" {
     }
     // Each pin of a page in the pool locks its partition one time. An unpin does not lock.
     for (fewest) |f| try std.testing.expectEqual(levels, f);
+}
+
+/// A tree for the vacuum tests, in a file of a test directory.
+const VacTest = struct {
+    tmp: std.testing.TmpDir,
+    file: Io.File,
+    log: Io.File,
+    t: BPTree,
+    vbuf: []u8,
+    out: []u8,
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    fn init(self: *VacTest) !void {
+        self.tmp = std.testing.tmpDir(.{});
+        self.file = try createTestFile(self.tmp.dir);
+        self.log = try createTestLog(self.tmp.dir);
+        self.t = try .init(gpa, io, self.file, self.log);
+        self.vbuf = try gpa.alloc(u8, 4 * ovfl_cap);
+        self.out = try gpa.alloc(u8, 4 * ovfl_cap);
+    }
+
+    fn deinit(self: *VacTest) void {
+        self.t.deinit(gpa);
+        gpa.free(self.vbuf);
+        gpa.free(self.out);
+        self.file.close(io);
+        self.log.close(io);
+        self.tmp.cleanup();
+    }
+
+    /// Drops the pool, as a crash would, and opens the tree again.
+    fn crash(self: *VacTest) !void {
+        self.t.deinit(gpa);
+        self.t = try .init(gpa, io, self.file, self.log);
+    }
+
+    fn fileLen(self: *VacTest) !u64 {
+        return self.file.length(io);
+    }
+
+    fn freePages(self: *VacTest) !u32 {
+        var n: u32 = 0;
+        var pg = self.t.freelist;
+        while (pg != 0) : (n += 1) {
+            const p = try self.t.getPage(pg);
+            defer self.t.pool.unpin(p, .clean);
+            pg = p.link();
+        }
+        return n;
+    }
+};
+
+test "BPTree vacuum truncates the free tail" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    try t.put("a", "1");
+    const small = t.npages;
+
+    // Three values of 4 pages each. The chains take new pages at the end of the file, in order.
+    for ("xyz", 0..) |c, i| try t.put(&.{c}, testValue(vt.vbuf, 4 * ovfl_cap, @intCast(i)));
+    try std.testing.expectEqual(small + 12, t.npages);
+    // The free list: the pages of "x", then the pages of "z".
+    try std.testing.expect(try t.delete("z"));
+    try std.testing.expect(try t.delete("x"));
+
+    // The pages of "z" are at the end, so they go. The pages of "x" are before the pages of "y", so they stay.
+    // The last page of "x" on the list gets a link of 0.
+    const s = try t.vacuum(.truncate);
+    try std.testing.expectEqual(BPTree.VacuumStats{ .before = small + 12, .after = small + 8, .moved = 0 }, s);
+    try std.testing.expectEqual(@as(u64, t.npages) * page_size, try vt.fileLen());
+    try std.testing.expectEqual(4, try vt.freePages());
+    try t.check(VacTest.gpa);
+    // Nothing more is at the end.
+    try std.testing.expectEqual(BPTree.VacuumStats{ .before = small + 8, .after = small + 8, .moved = 0 }, try t.vacuum(.truncate));
+
+    // The file stays short when the tree is open again, and the new free list works.
+    try vt.crash();
+    try std.testing.expectEqual(small + 8, t.npages);
+    try t.check(VacTest.gpa);
+    try std.testing.expectEqualSlices(u8, testValue(vt.vbuf, 4 * ovfl_cap, 1), (try t.get("y", vt.out)).?);
+    try t.put("x", testValue(vt.vbuf, 4 * ovfl_cap, 0));
+    try std.testing.expectEqual(small + 8, t.npages);
+    try std.testing.expectEqual(0, try vt.freePages());
+    try t.check(VacTest.gpa);
 }

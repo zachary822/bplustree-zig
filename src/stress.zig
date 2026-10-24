@@ -3,6 +3,7 @@
 //!   stress test [threads] [ops per thread] [rounds]
 //!   stress bench [threads] [read percent] [ops per thread]
 //!   stress scanmix [scan percent] [update percent] [ops] [nosync]
+//!   stress shrink [keep percent]
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -345,6 +346,31 @@ fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !
     std.process.exit(0);
 }
 
+/// Loads `bench_keys` keys, one value in four with a chain, and deletes all but `keep_pct` percent of them.
+/// Then it runs one vacuum with `mode`. It prints the size of the file after each step.
+fn shrink(t: *bpt.BPTree, io: Io, file: Io.File, keep_pct: usize, mode: bpt.BPTree.VacuumMode) !void {
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    t.durable = false;
+    for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
+    try t.sync();
+    const loaded = try file.length(io);
+    var prng: std.Random.DefaultPrng = .init(11);
+    const rand = prng.random();
+    for (0..bench_keys) |k| {
+        if (rand.uintLessThan(usize, 100) >= keep_pct) _ = try t.delete(keyOf(&kbuf, k));
+    }
+    try t.sync();
+    const deleted = try file.length(io);
+    const writes = t.pool.writes.raw;
+    const start = Io.Clock.Timestamp.now(io, .awake);
+    const s = try t.vacuum(mode);
+    const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+    std.debug.print("keep={d}% mode={t} loaded_kb={d} deleted_kb={d} vacuum_kb={d} pages={d}->{d} moved={d} page_writes={d} time_ms={d}\n", .{
+        keep_pct, mode, loaded / 1024, deleted / 1024, try file.length(io) / 1024, s.before, s.after, s.moved, t.pool.writes.raw - writes, ns / std.time.ns_per_ms,
+    });
+}
+
 /// Opens the tree in `path` and checks it: the tree must be whole, and every value must be a whole value of its key.
 fn verify(io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
     const f: Files = try .open(io, path, false);
@@ -446,6 +472,8 @@ pub fn main(init: std.process.Init) !void {
             sh.threads,                     sh.read_pct,    total,                        ns / std.time.ns_per_ms,
             total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs, @as(f64, @floatFromInt(t.pool.locks.raw - locks)) / @as(f64, @floatFromInt(total)),
         });
+    } else if (std.mem.eql(u8, mode, "shrink")) {
+        try shrink(&t, io, f.file, try arg(args, 2, 25), .truncate);
     } else if (std.mem.eql(u8, mode, "scanmix")) {
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
@@ -456,7 +484,8 @@ pub fn main(init: std.process.Init) !void {
         try scanmix(&t, io, try arg(args, 2, 5), try arg(args, 3, 0), try arg(args, 4, 50000));
     } else {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
-            " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>\n", .{});
+            " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>" ++
+            " | stress shrink [keep%]\n", .{});
         return error.BadArgs;
     }
 }
