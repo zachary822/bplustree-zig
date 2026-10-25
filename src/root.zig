@@ -526,7 +526,7 @@ const Pool = struct {
         self.lockPart(part, .exclusive);
         const entry = part.map.getOrPutAssumeCapacity(pgno);
         if (entry.found_existing) {
-            // another thread put the page in a frame while this one looked for a victime. the victim stays empty.
+            // another thread put the page in a frame while this one looked for a victim. the victim stays empty.
             _ = unpinFrame(fr, false);
             const f = entry.value_ptr.*;
             pinFound(&self.frames[f], ring != null);
@@ -684,15 +684,15 @@ pub const BPTree = struct {
             try t.sync();
         } else {
             try t.metaRead();
-            try t.recover(gpa);
+            try t.recover();
         }
 
         return t;
     }
 
     /// Releases the memory. It does not close the file. Changes that `sync` did not write are lost.
-    pub fn deinit(self: *BPTree, gpa: Allocator) void {
-        self.pool.deinit(gpa);
+    pub fn deinit(self: *BPTree) void {
+        self.pool.deinit(self.gpa);
     }
 
     pub fn sync(self: *BPTree) !void {
@@ -746,7 +746,7 @@ pub const BPTree = struct {
         self.freelist = get32(m[24..]);
     }
 
-    fn recover(self: *BPTree, gpa: Allocator) !void {
+    fn recover(self: *BPTree) !void {
         const io = self.pool.io;
         const wal = &self.pool.wal;
         var buf: [page_size]u8 = undefined;
@@ -772,13 +772,13 @@ pub const BPTree = struct {
             off = r.end;
         }
         self.root = root;
-        try self.rebuildFreeList(gpa);
+        try self.rebuildFreeList();
         try self.sync();
     }
 
-    fn rebuildFreeList(self: *BPTree, gpa: Allocator) !void {
-        const seen = try gpa.alloc(bool, self.npages);
-        defer gpa.free(seen);
+    fn rebuildFreeList(self: *BPTree) !void {
+        const seen = try self.gpa.alloc(bool, self.npages);
+        defer self.gpa.free(seen);
         @memset(seen, false);
         try self.markReachable(seen, self.root, 0);
         self.freelist = 0;
@@ -1282,6 +1282,8 @@ pub const BPTree = struct {
 
     pub fn getAlloc(self: *BPTree, gpa: Allocator, key: []const u8) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
+        self.gate.lockSharedUncancelable(self.pool.io);
+        defer self.gate.unlockShared(self.pool.io);
         var op: Op = .{};
         const path = try self.descend(&op, key, .read);
         defer self.releaseHeld(&op);
@@ -1614,7 +1616,6 @@ pub const BPTree = struct {
                 for (i..leaf.count()) |j| {
                     const k = leaf.cellKey(j);
                     if (hi) |h| if (!std.mem.lessThan(u8, k, h)) return count;
-                    // try visit(ctx, k, leaf.localVal(j));
                     const val = if (leaf.overflow(j) == 0) leaf.localVal(j) else blk: {
                         const len = leaf.valLen(j);
                         if (big.len < len) {
@@ -1649,9 +1650,9 @@ pub const BPTree = struct {
         }
     }
 
-    pub fn check(self: *BPTree, gpa: Allocator) !void {
-        const seen = try gpa.alloc(bool, self.npages);
-        defer gpa.free(seen);
+    pub fn check(self: *BPTree) !void {
+        const seen = try self.gpa.alloc(bool, self.npages);
+        defer self.gpa.free(seen);
         @memset(seen, false);
         var st: CheckState = .{ .seen = seen };
         try self.checkPage(&st, self.root, 0, null, null);
@@ -1720,7 +1721,7 @@ pub const BPTree = struct {
         var pg = first;
         var left = rest;
         while (left > 0) {
-            if (pg == 0) return checkFail("a chain ends {d} bytes earl", .{left});
+            if (pg == 0) return checkFail("a chain ends {d} bytes early", .{left});
             if (pg == meta_pgno or pg >= self.npages or st.seen[pg])
                 return checkFail("overflow page {d} is out of range or seen twice", .{pg});
             st.seen[pg] = true;
@@ -2044,7 +2045,7 @@ test BPTree {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     try t.metaWrite(5);
     try t.metaRead();
@@ -2071,13 +2072,13 @@ test "BPTree sync and reopen" {
     defer log.close(std.testing.io);
     {
         var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-        defer t.deinit(std.testing.allocator);
+        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         try t.sync();
     }
     // A new tree has an empty pool, so it reads all pages from the file.
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     for (0..N) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
         try std.testing.expectEqualStrings("value", (try t.get(k, &out)).?);
@@ -2098,7 +2099,7 @@ test "BPTree recovers after a crash" {
     const N = 2000;
     {
         var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit(std.testing.allocator);
+        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         for (0..N) |i| {
             if (i % 3 == 0) _ = try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}));
@@ -2106,8 +2107,8 @@ test "BPTree recovers after a crash" {
         // No sync: deinit drops the pool, as a crash would. Some pages reached the file and some did not.
     }
     var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit(std.testing.allocator);
-    try t.check(std.testing.allocator);
+    defer t.deinit();
+    try t.check();
     for (0..N) |i| {
         const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out);
         if (i % 3 == 0) try std.testing.expectEqual(null, got) else try std.testing.expectEqualStrings("value", got.?);
@@ -2133,7 +2134,7 @@ test "BPTree recovers values with chains after a crash" {
     var kbuf: [16]u8 = undefined;
     {
         var t: BPTree = try .init(gpa, io, file, log);
-        defer t.deinit(gpa);
+        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, lens[i % 3], 1));
         try t.sync();
         // After the sync: replace a third, delete a third. Old chains go to the free list, new chains come from it.
@@ -2147,9 +2148,9 @@ test "BPTree recovers values with chains after a crash" {
         // No sync: deinit drops the pool, as a crash would.
     }
     var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit(gpa);
+    defer t.deinit();
     // The orphan chain is on the free list, and no page of a live chain is.
-    try t.check(gpa);
+    try t.check();
     for (0..N) |i| {
         const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), out);
         switch (i % 3) {
@@ -2171,7 +2172,7 @@ test "BPTree freed chain page waits for the commit that freed it" {
     const log = try createTestLog(tmp.dir);
     defer log.close(io);
     var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit(gpa);
+    defer t.deinit();
 
     const big: [2 * ovfl_cap]u8 = @splat('b');
     try t.put("k", &big);
@@ -2195,7 +2196,7 @@ test "BPTree freed chain page waits for the commit that freed it" {
         try std.testing.expectEqual(.free, p.kind());
         if (pg == second) try std.testing.expectEqual(old, p.link());
     }
-    try t.check(gpa);
+    try t.check();
     try t.sync();
 }
 
@@ -2213,7 +2214,7 @@ test "BPTree recovery ignores an operation that did not commit" {
     const N = 500;
     {
         var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit(std.testing.allocator);
+        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         // An operation that crashed after it logged an image of the root, but before its commit record.
         var junk: [page_size]u8 = @splat(0xEE);
@@ -2221,8 +2222,8 @@ test "BPTree recovery ignores an operation that did not commit" {
         try log.setLength(io, end - Wal.rec_hdr);
     }
     var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit(std.testing.allocator);
-    try t.check(std.testing.allocator);
+    defer t.deinit();
+    try t.check();
     for (0..N) |i| try std.testing.expectEqualStrings("value", (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out)).?);
 }
 
@@ -2385,7 +2386,7 @@ test Pool {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     t.npages = pool_frames + 4;
     for (1..t.npages) |pg| {
@@ -2420,7 +2421,7 @@ test "Pool ring" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     testEmptyPool(&t);
     const pool = &t.pool;
 
@@ -2462,7 +2463,7 @@ test "Pool ring drops a frame whose write must force the log" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     testEmptyPool(&t);
     const pool = &t.pool;
 
@@ -2498,7 +2499,7 @@ test "BPTree large scan keeps a hot path in the pool" {
     const log = try createTestLog(tmp.dir);
     defer log.close(io);
     var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;
@@ -2529,7 +2530,7 @@ test "BPTree page alloc" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     // open allocates the root leaf as page 1.
     try std.testing.expectEqual(1, t.root);
@@ -2594,7 +2595,7 @@ test "Pool usage count" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     testEmptyPool(&t);
 
     // A miss gives a usage count of 1, and each pin of the page in the pool adds 1, up to max_usage.
@@ -2627,7 +2628,7 @@ test "Pool clock sweep" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     testEmptyPool(&t);
 
     // An empty frame has no pins and a usage count of 0, so the sweep takes the empty frames in order.
@@ -2666,7 +2667,7 @@ test "Pool clock sweep skips pinned frames" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     testEmptyPool(&t);
 
     var pinned: [pool_frames]Page = undefined;
@@ -2695,7 +2696,7 @@ test "Pool miss gives up a victim that another thread pinned" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     testEmptyPool(&t);
     const pool = &t.pool;
 
@@ -2730,7 +2731,7 @@ test "BPTree get" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     // Make a two-level tree by hand: the root holds "m", with "a" on the left and "m", "z" on the right.
     var cell: [page_size]u8 = undefined;
@@ -2819,7 +2820,7 @@ test "BPTree put get delete" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     const N = 2000;
     var order: [N]usize = undefined;
@@ -2838,7 +2839,7 @@ test "BPTree put get delete" {
     }
     try std.testing.expectEqual(0, t.pool.pinned());
     try std.testing.expect(t.npages > 2);
-    try t.check(std.testing.allocator);
+    try t.check();
 
     // Replace the values of the even keys.
     for (0..N) |i| {
@@ -2871,7 +2872,7 @@ test "BPTree put get delete" {
         }
     }
     try std.testing.expectEqual(0, t.pool.pinned());
-    try t.check(std.testing.allocator);
+    try t.check();
 
     const root = try t.getPage(t.root);
     defer t.pool.unpin(root, .clean);
@@ -2904,9 +2905,9 @@ test "BPTree large values" {
     var kbuf: [16]u8 = undefined;
     {
         var t: BPTree = try .init(gpa, io, file, log);
-        defer t.deinit(gpa);
+        defer t.deinit();
         for (lens, 0..) |len, i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, len, @intCast(i)));
-        try t.check(gpa);
+        try t.check();
         // Each chain has just enough pages: the root leaf and the chains are all the pages of the tree.
         var chain_pages: usize = 0;
         for (lens) |len| chain_pages += std.math.divCeil(usize, len - localSize(len), ovfl_cap) catch unreachable;
@@ -2915,7 +2916,7 @@ test "BPTree large values" {
     }
     // A new tree reads all pages from the file.
     var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit(gpa);
+    defer t.deinit();
     for (lens, 0..) |len, i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
         const want = testValue(vbuf, len, @intCast(i));
@@ -2951,7 +2952,7 @@ test "BPTree replace and delete free chains" {
     const log = try createTestLog(tmp.dir);
     defer log.close(io);
     var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit(gpa);
+    defer t.deinit();
 
     const lens = [_]usize{ 10, max_local + 1, 2 * ovfl_cap, 5 * ovfl_cap };
     const vbuf = try gpa.alloc(u8, lens[lens.len - 1]);
@@ -2972,7 +2973,7 @@ test "BPTree replace and delete free chains" {
             cur[i] = prng.random().uintLessThan(usize, lens.len);
             try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, lens[cur[i]], @intCast(round)));
         }
-        try t.check(gpa);
+        try t.check();
         for (0..keys) |i| {
             const got = (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), out)).?;
             try std.testing.expectEqualSlices(u8, testValue(vbuf, lens[cur[i]], @intCast(round)), got);
@@ -2982,7 +2983,7 @@ test "BPTree replace and delete free chains" {
 
     // After the deletes, every page but the root leaf is on the free list.
     for (0..keys) |i| try std.testing.expect(try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i})));
-    try t.check(gpa);
+    try t.check();
     var free: usize = 0;
     var pg = t.freelist;
     while (pg != 0) : (free += 1) {
@@ -3004,7 +3005,7 @@ test "BPTree failed put frees its new chain" {
     const log = try createTestLog(tmp.dir);
     defer log.close(io);
     var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit(gpa);
+    defer t.deinit();
 
     // Fill the root leaf with small values, so that the cell of the big value splits it.
     const huge: [3 * ovfl_cap]u8 = @splat('h');
@@ -3029,7 +3030,7 @@ test "BPTree failed put frees its new chain" {
 
     // The chain was written: the file grew. Its pages are on the free list, and the tree is as it was.
     try std.testing.expect(t.npages >= npages + 3);
-    try t.check(gpa);
+    try t.check();
     try std.testing.expectEqual(null, try t.get("zzz", &out));
     for (0..n) |i| try std.testing.expectEqualStrings(&val, (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out)).?);
 }
@@ -3042,7 +3043,7 @@ test "BPTree scan" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     // Only the odd numbers, so that a bound can fall between two keys.
     const N = 2000;
@@ -3118,7 +3119,7 @@ test "BPTree failed operation does not change the tree" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
 
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;
@@ -3226,7 +3227,7 @@ test "BPTree pool lock count" {
     const log = try createTestLog(tmp.dir);
     defer log.close(std.testing.io);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit(std.testing.allocator);
+    defer t.deinit();
     t.durable = false;
 
     var kbuf: [16]u8 = undefined;
@@ -3283,7 +3284,7 @@ const VacTest = struct {
     }
 
     fn deinit(self: *VacTest) void {
-        self.t.deinit(gpa);
+        self.t.deinit();
         gpa.free(self.vbuf);
         gpa.free(self.out);
         self.file.close(io);
@@ -3293,7 +3294,7 @@ const VacTest = struct {
 
     /// Drops the pool, as a crash would, and opens the tree again.
     fn crash(self: *VacTest) !void {
-        self.t.deinit(gpa);
+        self.t.deinit();
         self.t = try .init(gpa, io, self.file, self.log);
     }
 
@@ -3344,7 +3345,7 @@ const VacTest = struct {
 
     /// Checks the tree, and that keys `0..n` are in it if `keep` accepts them.
     fn expect(self: *VacTest, n: usize, comptime keep: fn (usize) bool) !void {
-        try self.t.check(gpa);
+        try self.t.check();
         var kbuf: [key_len]u8 = undefined;
         for (0..n) |i| {
             const got = try self.t.get(key(&kbuf, i), self.out);
@@ -3376,19 +3377,19 @@ test "BPTree vacuum truncates the free tail" {
     try std.testing.expectEqual(BPTree.VacuumStats{ .before = small + 12, .after = small + 8, .moved = 0 }, s);
     try std.testing.expectEqual(@as(u64, t.npages) * page_size, try vt.fileLen());
     try std.testing.expectEqual(4, try vt.freePages());
-    try t.check(VacTest.gpa);
+    try t.check();
     // Nothing more is at the end.
     try std.testing.expectEqual(BPTree.VacuumStats{ .before = small + 8, .after = small + 8, .moved = 0 }, try t.vacuum(.truncate));
 
     // The file stays short when the tree is open again, and the new free list works.
     try vt.crash();
     try std.testing.expectEqual(small + 8, t.npages);
-    try t.check(VacTest.gpa);
+    try t.check();
     try std.testing.expectEqualSlices(u8, testValue(vt.vbuf, 4 * ovfl_cap, 1), (try t.get("y", vt.out)).?);
     try t.put("x", testValue(vt.vbuf, 4 * ovfl_cap, 0));
     try std.testing.expectEqual(small + 8, t.npages);
     try std.testing.expectEqual(0, try vt.freePages());
-    try t.check(VacTest.gpa);
+    try t.check();
 }
 
 /// The value length of key `i` in the vacuum tests: one value in five has a chain of up to three pages.
@@ -3556,7 +3557,7 @@ test "BPTree vacuum crash after the new free list is in the file" {
     // Recovery sees the log record and builds the free list again.
     try std.testing.expectEqual(npages, t.npages);
     try std.testing.expectEqual(12, try vt.freePages());
-    try t.check(VacTest.gpa);
+    try t.check();
     try std.testing.expectEqualSlices(u8, testValue(vt.vbuf, 4 * ovfl_cap, 2), (try t.get("y", vt.out)).?);
 }
 
@@ -3786,7 +3787,7 @@ test "BPTree vacuum while other threads use the tree" {
     };
     _ = try t.vacuum(.full);
     try std.testing.expectEqual(0, t.freelist);
-    try t.check(VacTest.gpa);
+    try t.check();
     try vt.crash();
     try vt.expect(N, keepThird);
 }

@@ -341,7 +341,7 @@ fn online(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, step: u32
     std.debug.print("step={d} busy={d}% steps={d} step_p50_us<{d} step_max_ms={d} pages={d}->{d} moved={d} time_ms={d}\n", .{
         step, busy_pct, steps.n, steps.quantile(0.5), steps.max_ns / std.time.ns_per_ms, before, t.npages, moved, ns / std.time.ns_per_ms,
     });
-    try t.check(gpa);
+    try t.check();
 }
 
 /// Scans `scan_len` keys in `scan_pct` percent of the operations, and updates any key (a get and then a put)
@@ -586,8 +586,8 @@ fn verify(io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
     const f: Files = try .open(io, path, false);
     defer f.close(io);
     var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
-    defer t.deinit(gpa);
-    try t.check(gpa);
+    defer t.deinit();
+    try t.check();
     const V = struct {
         fn visit(_: void, key: []const u8, val: []const u8) !void {
             const k = keyNum(key) orelse return error.BadKey;
@@ -625,7 +625,7 @@ pub fn main(init: std.process.Init) !void {
         Files.delete(io, name);
     }
     var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
-    defer t.deinit(gpa);
+    defer t.deinit();
 
     var done: std.atomic.Value(bool) = .init(false);
     const dog = try std.Thread.spawn(.{}, watchdog, .{ io, &done });
@@ -652,7 +652,7 @@ pub fn main(init: std.process.Init) !void {
             vac.stop.store(true, .release);
             vt.join();
             // Every thread has stopped, so the tree must be whole and hold exactly what the writers put.
-            try t.check(gpa);
+            try t.check();
             var present: usize = 0;
             for (sh.vers, 0..) |ver, k| {
                 const got = try t.get(keyOf(&kbuf, k), &out);
@@ -669,7 +669,7 @@ pub fn main(init: std.process.Init) !void {
             if (n != present) fail("scan of all keys gives {d} keys, but {d} are in the tree", .{ n, present });
             // Vacuum, and check the tree again. The next round runs on the shorter file.
             const vs = try t.vacuum(.full);
-            try t.check(gpa);
+            try t.check();
             c = .{ .sh = &sh, .id = null, .lo = 0, .hi = test_keys - 1, .next = 0 };
             if (try t.scan(null, null, &c, ScanCheck.visit) != present) fail("scan after vacuum: wrong key count", .{});
             c.missing(test_keys);

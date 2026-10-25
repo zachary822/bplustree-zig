@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer log.close(io);
 
     var t: bplustree_zig.BPTree = try .init(gpa, io, file, log);
-    defer t.deinit(gpa);
+    defer t.deinit();
 
     try t.sync();
     return 0;
