@@ -648,6 +648,26 @@ const Op = struct {
         for (op.freed.items()) |f| if (f.page == p.page) return true;
         return false;
     }
+
+    fn pageFree(op: *Op, p: Page) void {
+        std.debug.assert(op.owns(p));
+        p.init(.free);
+        op.freed.push(p);
+    }
+
+    fn markChanged(op: *Op, p: Page) void {
+        std.debug.assert(op.owns(p));
+        for (op.changed.items()) |c| if (c.page == p.page) return;
+        op.changed.push(p);
+    }
+
+    /// Frees the spare pages that the operation did not use. The reverse order puts the freelist back as it was.
+    fn releaseSpares(op: *Op) void {
+        while (op.spares > 0) {
+            op.spares -= 1;
+            op.pageFree(op.reserved.buf[op.spares]);
+        }
+    }
 };
 
 pub const BPTree = struct {
@@ -1094,20 +1114,6 @@ pub const BPTree = struct {
         return p;
     }
 
-    fn pageFree(self: *BPTree, op: *Op, p: Page) void {
-        _ = self;
-        std.debug.assert(op.owns(p));
-        p.init(.free);
-        op.freed.push(p);
-    }
-
-    fn changed(self: *BPTree, op: *Op, p: Page) void {
-        _ = self;
-        std.debug.assert(op.owns(p));
-        for (op.changed.items()) |c| if (c.page == p.page) return;
-        op.changed.push(p);
-    }
-
     fn commit(self: *BPTree, op: *Op) void {
         if (op.changed.len > 0) {
             const root = if (op.root_latch == .exclusive) self.root else 0;
@@ -1186,14 +1192,6 @@ pub const BPTree = struct {
         const p = op.reserved.buf[op.spares];
         p.init(t);
         return p;
-    }
-
-    /// Frees the spare pages that the operation did not use. The reverse order puts the freelist back as it was.
-    fn releaseSpares(self: *BPTree, op: *Op) void {
-        while (op.spares > 0) {
-            op.spares -= 1;
-            self.pageFree(op, op.reserved.buf[op.spares]);
-        }
     }
 
     /// The maximum number of new pages that a chain of splits needs when level `d` gets a cell.
@@ -1375,7 +1373,7 @@ pub const BPTree = struct {
         std.debug.assert(d >= op.top);
         const p = path[d].page;
         if (p.insertCell(idx, c)) {
-            self.changed(op, p);
+            op.markChanged(p);
             return false;
         }
 
@@ -1402,8 +1400,8 @@ pub const BPTree = struct {
             p.fill(.internal, p.link(), cl, 0, s);
             break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
         };
-        self.changed(op, right);
-        self.changed(op, p);
+        op.markChanged(right);
+        op.markChanged(p);
 
         if (d == 0) {
             std.debug.assert(op.root_latch == .exclusive);
@@ -1411,7 +1409,7 @@ pub const BPTree = struct {
             root.setLink(p.pgno);
             _ = root.insertCell(0, sep);
             self.root = root.pgno;
-            self.changed(op, root);
+            op.markChanged(root);
         } else {
             _ = self.insertUp(op, path, d - 1, path[d - 1].idx, sep);
         }
@@ -1422,7 +1420,7 @@ pub const BPTree = struct {
         var path = try self.descend(op, key, how);
         defer self.finish(op);
         const leaf = path.leaf();
-        defer self.releaseSpares(op);
+        defer op.releaseSpares();
 
         const r = leaf.search(key);
         const old_sz = if (r.found) leaf.cell(r.index).len + 2 else 0;
@@ -1443,7 +1441,7 @@ pub const BPTree = struct {
         if (r.found) {
             op.old_chain = leaf.overflow(r.index);
             leaf.deleteCell(r.index);
-            self.changed(op, leaf);
+            op.markChanged(leaf);
         }
         const split = self.insertUp(op, path.slice(), path.depth, r.index, cell);
         std.debug.assert(split == splits);
@@ -1484,7 +1482,7 @@ pub const BPTree = struct {
             if (p.kind() == .internal and p.count() == 0) {
                 std.debug.assert(op.root_latch == .exclusive);
                 self.root = p.link();
-                self.pageFree(op, p);
+                op.pageFree(p);
             }
             return;
         }
@@ -1514,10 +1512,10 @@ pub const BPTree = struct {
         if (cl.bytes(0, cl.cells.len) <= capacity) {
             const link = if (leaf) right.link() else left.link();
             left.fill(left.kind(), link, cl, 0, cl.cells.len);
-            self.pageFree(op, right);
-            self.changed(op, left);
+            op.pageFree(right);
+            op.markChanged(left);
             parent.deleteCell(sep_idx);
-            self.changed(op, parent);
+            op.markChanged(parent);
             self.rebalance(op, path, d - 1);
             return;
         }
@@ -1536,10 +1534,10 @@ pub const BPTree = struct {
             right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
             break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
         };
-        self.changed(op, left);
-        self.changed(op, right);
+        op.markChanged(left);
+        op.markChanged(right);
         parent.deleteCell(sep_idx);
-        self.changed(op, parent);
+        op.markChanged(parent);
 
         if (!self.insertUp(op, path, d - 1, sep_idx, sep)) {
             self.rebalance(op, path, d - 1);
@@ -1550,7 +1548,7 @@ pub const BPTree = struct {
         var path = try self.descend(op, key, how);
         defer self.finish(op);
         const leaf = path.leaf();
-        defer self.releaseSpares(op);
+        defer op.releaseSpares();
 
         const r = leaf.search(key);
         if (!r.found) return false;
@@ -1564,7 +1562,7 @@ pub const BPTree = struct {
 
         op.old_chain = leaf.overflow(r.index);
         leaf.deleteCell(r.index);
-        self.changed(op, leaf);
+        op.markChanged(leaf);
         self.rebalance(op, path.slice(), path.depth);
         return true;
     }
@@ -2544,7 +2542,7 @@ test "BPTree page alloc" {
 
     var op: Op = .{};
     op.reserved.push(a);
-    t.pageFree(&op, a);
+    op.pageFree(a);
     try std.testing.expectEqual(0, t.freelist);
     t.finish(&op);
     try std.testing.expectEqual(a_pgno, t.freelist);
