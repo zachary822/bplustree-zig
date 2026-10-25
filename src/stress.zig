@@ -7,6 +7,7 @@
 //!   stress vaccrash <file> <seed> <ms>
 //!   stress online [threads] [step] [busy percent] [read percent]
 //!   stress onlinecrash <file> <seed> <ms>
+//!   stress walgrow [threads] [seconds] [read percent]
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -344,6 +345,39 @@ fn online(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, step: u32
     try t.check();
 }
 
+/// Loads `bench_keys` keys and syncs. Then `threads` threads get and put keys for `secs` seconds, and nothing
+/// calls `sync`. It prints the size of the log after each second. At the end it calls `sync` while the threads
+/// still run, and prints how long the sync took and the latencies of the operations around it.
+fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files, secs: usize) !void {
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    t.durable = false;
+    for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
+    try t.sync();
+    t.durable = true;
+    sh.lats = try gpa.alloc(Lat, sh.threads);
+    defer gpa.free(sh.lats);
+    @memset(sh.lats, .{});
+
+    const th = try runInBackground(onlineWorker, sh, 5);
+    for (1..secs + 1) |s| {
+        try io.sleep(.fromSeconds(1), .awake);
+        std.debug.print("second {d}: log_kb={d}\n", .{ s, try f.logLength(io) / 1024 });
+    }
+    // The latencies from here on are of the operations around the sync.
+    @memset(sh.lats, .{});
+    const start = Io.Clock.Timestamp.now(io, .awake);
+    try t.sync();
+    const sync_ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+    try io.sleep(.fromMilliseconds(200), .awake);
+    const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+    sh.stop.store(true, .release);
+    th.join();
+    std.debug.print("sync: time_ms={d} log_kb_after={d}\n", .{ sync_ns / std.time.ns_per_ms, try f.logLength(io) / 1024 });
+    printLat("around the sync", sh, ns);
+    try t.check();
+}
+
 /// Scans `scan_len` keys in `scan_pct` percent of the operations, and updates any key (a get and then a put)
 /// in `update_pct` percent. The other operations are gets, 9 of 10 to a hot key.
 /// It runs in one thread, so the pool counters show which operation read which pages.
@@ -444,29 +478,39 @@ fn watchdog(io: Io, done: *std.atomic.Value(bool)) void {
     }
 }
 
-/// A tree's file and its log, which is the same path with `.wal` added.
+/// A tree's file and its two log files, which are the same path with `.wal0` and `.wal1` added.
 const Files = struct {
     file: Io.File,
-    log: Io.File,
+    log: [2]Io.File,
+
+    fn logPath(buf: []u8, path: []const u8, i: usize) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}.wal{d}", .{ path, i });
+    }
 
     fn open(io: Io, path: []const u8, truncate: bool) !Files {
         var buf: [256]u8 = undefined;
-        const log_path = try std.fmt.bufPrint(&buf, "{s}.wal", .{path});
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = truncate });
         errdefer file.close(io);
-        const log = try Io.Dir.cwd().createFile(io, log_path, .{ .read = true, .truncate = truncate });
-        return .{ .file = file, .log = log };
+        const a = try Io.Dir.cwd().createFile(io, try logPath(&buf, path, 0), .{ .read = true, .truncate = truncate });
+        errdefer a.close(io);
+        const b = try Io.Dir.cwd().createFile(io, try logPath(&buf, path, 1), .{ .read = true, .truncate = truncate });
+        return .{ .file = file, .log = .{ a, b } };
     }
 
     fn close(f: Files, io: Io) void {
         f.file.close(io);
-        f.log.close(io);
+        for (f.log) |l| l.close(io);
+    }
+
+    /// The bytes in both log files.
+    fn logLength(f: Files, io: Io) !u64 {
+        return try f.log[0].length(io) + try f.log[1].length(io);
     }
 
     fn delete(io: Io, path: []const u8) void {
         var buf: [256]u8 = undefined;
         Io.Dir.cwd().deleteFile(io, path) catch {};
-        Io.Dir.cwd().deleteFile(io, std.fmt.bufPrint(&buf, "{s}.wal", .{path}) catch return) catch {};
+        for (0..2) |i| Io.Dir.cwd().deleteFile(io, logPath(&buf, path, i) catch return) catch {};
     }
 };
 
@@ -708,6 +752,9 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, mode, "online")) {
         var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 5, 90), .ops = 0 };
         try online(&t, io, gpa, &sh, @intCast(try arg(args, 3, 256)), @intCast(try arg(args, 4, 25)));
+    } else if (std.mem.eql(u8, mode, "walgrow")) {
+        var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 4, 50), .ops = 0 };
+        try walGrow(&t, io, gpa, &sh, f, try arg(args, 3, 10));
     } else if (std.mem.eql(u8, mode, "scanmix")) {
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
@@ -720,7 +767,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
             " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>" ++
             " | stress shrink [keep%] [truncate|full|pages] | stress vaccrash <file> <seed> <ms>" ++
-            " | stress online [threads] [step] [busy%] [read%] | stress onlinecrash <file> <seed> <ms>\n", .{});
+            " | stress online [threads] [step] [busy%] [read%] | stress onlinecrash <file> <seed> <ms>" ++
+            " | stress walgrow [threads] [seconds] [read%]\n", .{});
         return error.BadArgs;
     }
 }
