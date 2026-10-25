@@ -1,6 +1,8 @@
 //! A stress test and a benchmark for the tree.
 //!
 //!   stress test [threads] [ops per thread] [rounds]
+//!   stress crash <file> <seed> <ms>
+//!   stress verify <file>
 //!   stress bench [threads] [read percent] [ops per thread]
 //!   stress scanmix [scan percent] [update percent] [ops] [nosync]
 //!   stress shrink [keep percent] [truncate | full | pages]
@@ -57,6 +59,17 @@ fn valVersion(v: []const u8, k: usize) ?u32 {
     return ver;
 }
 
+/// Puts keys `0..n` into `t` and syncs. Each value is `val`, or version 1 of the key's value if `val` is null.
+/// The puts do not wait for the log, and `t.durable` is true at the end.
+fn load(t: *bpt.BPTree, n: usize, val: ?[]const u8) !void {
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    t.durable = false;
+    for (0..n) |k| try t.put(keyOf(&kbuf, k), val orelse makeVal(&vbuf, k, 1));
+    try t.sync();
+    t.durable = true;
+}
+
 fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.panic("stress: " ++ fmt, args);
 }
@@ -88,7 +101,19 @@ const Shared = struct {
         _ = sh.retries.fetchAdd(1, .monotonic);
         std.Thread.yield() catch {};
     }
+
+    /// Calls `f` with `args` until it does not fail with error.PoolExhausted.
+    fn retry(sh: *Shared, comptime f: anytype, args: anytype) !Payload(f) {
+        while (true) return @call(.auto, f, args) catch |err| {
+            try sh.again(err);
+            continue;
+        };
+    }
 };
+
+fn Payload(comptime f: anytype) type {
+    return @typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?).error_union.payload;
+}
 
 /// Checks one scan of the keys `lo..hi`. The keys must come in order and inside the bounds, and each value must be whole.
 /// The keys that thread `id` writes must be exactly the ones it put, with their last versions.
@@ -138,10 +163,7 @@ fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
         if (roll < 40) {
             // Get any key. A key that another thread writes can have any version, but it must be whole.
             const k = rand.uintLessThan(usize, test_keys);
-            const got = while (true) break t.get(keyOf(&kbuf, k), &out) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            const got = try sh.retry(bpt.BPTree.get, .{ t, keyOf(&kbuf, k), &out });
             if (got) |v| {
                 const ver = valVersion(v, k) orelse fail("get {d}: a torn or wrong value", .{k});
                 if (k % sh.threads == id and ver != sh.vers[k]) fail("get {d}: version {d}, put {d}", .{ k, ver, sh.vers[k] });
@@ -171,16 +193,10 @@ fn testWorker(sh: *Shared, id: usize, seed: u64) !void {
         const k = id + sh.threads * rand.uintLessThan(usize, owned);
         if (roll < 80) {
             const ver = rand.int(u32) | 1;
-            while (true) break t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, ver)) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            try sh.retry(bpt.BPTree.put, .{ t, keyOf(&kbuf, k), makeVal(&vbuf, k, ver) });
             sh.vers[k] = ver;
         } else {
-            const found = while (true) break t.delete(keyOf(&kbuf, k)) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            const found = try sh.retry(bpt.BPTree.delete, .{ t, keyOf(&kbuf, k) });
             if (found != (sh.vers[k] != 0)) fail("delete {d}: found is {}", .{ k, found });
             sh.vers[k] = 0;
         }
@@ -200,15 +216,9 @@ fn benchWorker(sh: *Shared, id: usize, seed: u64) !void {
     for (0..sh.ops) |_| {
         const k = keyOf(&kbuf, rand.uintLessThan(usize, bench_keys));
         if (rand.uintLessThan(usize, 100) < sh.read_pct) {
-            _ = while (true) break t.get(k, &out) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            _ = try sh.retry(bpt.BPTree.get, .{ t, k, &out });
         } else {
-            while (true) break t.put(k, vbuf[0..50]) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            try sh.retry(bpt.BPTree.put, .{ t, k, vbuf[0..50] });
         }
     }
 }
@@ -260,15 +270,9 @@ fn onlineWorker(sh: *Shared, id: usize, seed: u64) !void {
         const key = keyOf(&kbuf, k);
         const start = Io.Clock.Timestamp.now(io, .awake);
         if (rand.uintLessThan(usize, 100) < sh.read_pct) {
-            _ = while (true) break t.get(key, &out) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            _ = try sh.retry(bpt.BPTree.get, .{ t, key, &out });
         } else {
-            while (true) break t.put(key, makeVal(&vbuf, k, rand.int(u32) | 1)) catch |err| {
-                try sh.again(err);
-                continue;
-            };
+            try sh.retry(bpt.BPTree.put, .{ t, key, makeVal(&vbuf, k, rand.int(u32) | 1) });
         }
         lat.add(@intCast(start.untilNow(io).raw.toNanoseconds()));
     }
@@ -298,9 +302,8 @@ fn printLat(what: []const u8, sh: *const Shared, ns: u64) void {
 /// It prints the latencies of the operations in both parts, and how long each step held them out.
 fn online(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, step: u32, busy_pct: u32) !void {
     var kbuf: [16]u8 = undefined;
-    var vbuf: [max_test_val]u8 = undefined;
+    try load(t, bench_keys, null);
     t.durable = false;
-    for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
     var prng: std.Random.DefaultPrng = .init(11);
     const rand = prng.random();
     for (0..bench_keys) |k| {
@@ -353,12 +356,7 @@ const GrowMode = enum { none, ckpt, auto };
 /// prints what it did. At the end it calls `sync` while the threads still run, and prints how long the sync took
 /// and the latencies of the operations around it.
 fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files, secs: usize, mode: GrowMode) !void {
-    var kbuf: [16]u8 = undefined;
-    var vbuf: [max_test_val]u8 = undefined;
-    t.durable = false;
-    for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
-    try t.sync();
-    t.durable = true;
+    try load(t, bench_keys, null);
     sh.lats = try gpa.alloc(Lat, sh.threads);
     defer gpa.free(sh.lats);
     @memset(sh.lats, .{});
@@ -564,17 +562,18 @@ fn crashWorker(t: *bpt.BPTree, id: usize, seed: u64) void {
 
 const crash_threads = 4;
 
+/// Makes a new tree in `path` and loads `test_keys` keys. The files stay open until the process ends.
+fn fresh(io: Io, gpa: std.mem.Allocator, path: []const u8) !bpt.BPTree {
+    const f: Files = try .open(io, path, true);
+    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
+    try load(&t, test_keys, null);
+    return t;
+}
+
 /// Fills a new tree in `path`, syncs it, and then writes from `crash_threads` threads
 /// until the process ends after `ms` milliseconds, in the middle of their operations.
 fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
-    const f: Files = try .open(io, path, true);
-    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
-    var kbuf: [16]u8 = undefined;
-    var vbuf: [max_test_val]u8 = undefined;
-    t.durable = false;
-    for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
-    try t.sync();
-    t.durable = true;
+    var t = try fresh(io, gpa, path);
     // Many checkpoints, so that the crash often comes in the middle of one.
     t.ckpt_bytes = 256 << 10;
     for (0..crash_threads) |id| _ = try std.Thread.spawn(.{}, crashWorker, .{ &t, id, seed + id });
@@ -587,10 +586,8 @@ fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !
 /// Then it runs one vacuum with `mode`. It prints the size of the file after each step.
 fn shrink(t: *bpt.BPTree, io: Io, file: Io.File, keep_pct: usize, mode: bpt.BPTree.VacuumMode) !void {
     var kbuf: [16]u8 = undefined;
-    var vbuf: [max_test_val]u8 = undefined;
+    try load(t, bench_keys, null);
     t.durable = false;
-    for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
-    try t.sync();
     const loaded = try file.length(io);
     var prng: std.Random.DefaultPrng = .init(11);
     const rand = prng.random();
@@ -617,13 +614,10 @@ fn exitAfter(io: Io, ms: u64) void {
 /// Fills a new tree in `path` and syncs it. Then it changes keys and vacuums the tree in a loop,
 /// until the process ends after `ms` milliseconds, often in the middle of a vacuum.
 fn vacuumCrash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
-    const f: Files = try .open(io, path, true);
-    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
+    var t = try fresh(io, gpa, path);
     var kbuf: [16]u8 = undefined;
     var vbuf: [max_test_val]u8 = undefined;
     t.durable = false;
-    for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
-    try t.sync();
     _ = try std.Thread.spawn(.{}, exitAfter, .{ io, ms });
     var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
@@ -646,14 +640,7 @@ fn vacuumCrash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: 
 /// Like `crash`, but the main thread also vacuums the tree in steps while the writers run, as a service would.
 /// The process ends after `ms` milliseconds, in the middle of the operations and of a step.
 fn onlineCrash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
-    const f: Files = try .open(io, path, true);
-    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
-    var kbuf: [16]u8 = undefined;
-    var vbuf: [max_test_val]u8 = undefined;
-    t.durable = false;
-    for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
-    try t.sync();
-    t.durable = true;
+    var t = try fresh(io, gpa, path);
     for (0..crash_threads) |id| _ = try std.Thread.spawn(.{}, crashWorker, .{ &t, id, seed + id });
     _ = try std.Thread.spawn(.{}, exitAfter, .{ io, ms });
     while (true) _ = t.vacuumOnline(.full, 32, 50) catch |err| if (err != error.PoolExhausted) return err;
@@ -763,12 +750,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("stress test passed: {d} threads, {d} ops each, {d} rounds, {d} retries\n", .{ sh.threads, sh.ops, rounds, sh.retries.raw });
     } else if (std.mem.eql(u8, mode, "bench")) {
         var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 3, 90), .ops = try arg(args, 4, 50000) };
-        var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
-        // Load without waiting for the log after every put. The sync at the end makes it all durable.
-        t.durable = false;
-        for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), &val);
-        try t.sync();
+        try load(&t, bench_keys, &val);
         t.durable = args.len <= 5 or !std.mem.eql(u8, args[5], "nosync");
 
         const syncs = t.pool.wal.syncs.raw;
@@ -797,11 +780,8 @@ pub fn main(init: std.process.Init) !void {
         const gmode = if (args.len > 5) std.meta.stringToEnum(GrowMode, args[5]) orelse return error.BadArgs else .none;
         try walGrow(&t, io, gpa, &sh, f, try arg(args, 3, 10), gmode);
     } else if (std.mem.eql(u8, mode, "scanmix")) {
-        var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
-        t.durable = false;
-        for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), &val);
-        try t.sync();
+        try load(&t, bench_keys, &val);
         t.durable = args.len <= 5 or !std.mem.eql(u8, args[5], "nosync");
         try scanmix(&t, io, try arg(args, 2, 5), try arg(args, 3, 0), try arg(args, 4, 50000));
     } else {

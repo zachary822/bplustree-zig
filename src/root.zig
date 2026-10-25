@@ -18,8 +18,9 @@ const max_depth = 32;
 const hdr_size = 12;
 const capacity = page_size - hdr_size;
 const min_fill = capacity / 4;
+const max_internal_cell = 6 + max_key;
 /// The largest separator cell, with its slot, that a split sends to a parent.
-const max_sep = max_key + 6 + 2;
+const max_sep = max_internal_cell + 2;
 /// fewest bytes of value that leaf cell keeps when there are overflow pages
 const min_local = page_size / 16;
 const ovfl_cap = page_size - hdr_size;
@@ -544,8 +545,8 @@ const Pool = struct {
         return .{ .page = self.frameData(f), .pgno = fr.pgno.? };
     }
 
-    fn pin(self: *Pool, page: u32, mode: Load) !Page {
-        return self.pinWith(page, mode, null);
+    fn pin(self: *Pool, pgno: u32, mode: Load) !Page {
+        return self.pinWith(pgno, mode, null);
     }
 
     fn pinWith(self: *Pool, pgno: u32, mode: Load, ring: ?*Ring) !Page {
@@ -828,12 +829,7 @@ pub const BPTree = struct {
         self.gate.lockUncancelable(io);
         const ck: Checkpoint, const n = blk: {
             defer self.gate.unlock(io);
-            const ck = self.pending orelse ck: {
-                _ = try self.pool.wal.nextRun(io);
-                break :ck self.here();
-            };
-            self.pending = ck;
-            break :blk .{ ck, self.pool.dirtyPages(dirty) };
+            break :blk .{ try self.checkpointStart(), self.pool.dirtyPages(dirty) };
         };
         const pause_ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
 
@@ -872,15 +868,19 @@ pub const BPTree = struct {
     /// Writes all changed pages and the meta page, and then syncs the file.
     fn syncLocked(self: *BPTree) !void {
         const io = self.pool.io;
-        const ck = self.pending orelse blk: {
-            _ = try self.pool.wal.nextRun(io);
-            break :blk self.here();
-        };
-        self.pending = ck;
+        const ck = try self.checkpointStart();
         try self.pool.wal.flushTo(io, self.pool.wal.end.load(.acquire));
         try self.pool.flush();
         try self.checkpointEnd(ck);
         self.pending = null;
+    }
+
+    /// Starts a new run, unless a checkpoint that did not end started one. The caller holds the gate exclusive.
+    fn checkpointStart(self: *BPTree) !Checkpoint {
+        if (self.pending) |ck| return ck;
+        _ = try self.pool.wal.nextRun(self.pool.io);
+        self.pending = self.here();
+        return self.pending.?;
     }
 
     fn here(self: *BPTree) Checkpoint {
@@ -960,44 +960,19 @@ pub const BPTree = struct {
     }
 
     fn rebuildFreeList(self: *BPTree) !void {
-        const seen = try self.gpa.alloc(bool, self.npages);
-        defer self.gpa.free(seen);
-        @memset(seen, false);
-        try self.markReachable(seen, self.root, 0);
+        const owners = try self.gpa.alloc(Owner, self.npages);
+        defer self.gpa.free(owners);
+        @memset(owners, .{});
+        var last_leaf: u32 = 0;
+        try self.markOwners(owners, self.root, .{ .kind = .root }, &last_leaf, 0);
         self.freelist = 0;
         var pg = self.npages;
         while (pg > 1) {
             pg -= 1;
-            if (seen[pg]) continue;
+            if (owners[pg].kind != .free) continue;
             const p = try self.pool.pin(pg, .no_load);
-            p.init(.free);
-            p.setLink(self.freelist);
-            self.freelist = pg;
+            self.pushFree(p);
             self.pool.unpin(p, .dirty);
-        }
-    }
-
-    fn markReachable(self: *BPTree, seen: []bool, pgno: u32, depth: usize) !void {
-        if (pgno == meta_pgno or pgno >= self.npages or seen[pgno] or depth >= max_depth) return error.BadFile;
-        seen[pgno] = true;
-        const p = try self.getPage(pgno);
-        defer self.pool.unpin(p, .clean);
-        switch (p.kind()) {
-            .leaf => for (0..p.count()) |i| try self.markChain(seen, p.overflow(i)),
-            .internal => for (0..p.count() + 1) |i| try self.markReachable(seen, p.child(i), depth + 1),
-            else => return error.BadFile,
-        }
-    }
-
-    fn markChain(self: *BPTree, seen: []bool, first: u32) !void {
-        var pg = first;
-        while (pg != 0) {
-            if (pg == meta_pgno or pg >= self.npages or seen[pg]) return error.BadFile;
-            seen[pg] = true;
-            const p = try self.getPage(pg);
-            defer self.pool.unpin(p, .clean);
-            if (p.kind() != .overflow) return error.BadFile;
-            pg = p.link();
         }
     }
 
@@ -1250,8 +1225,7 @@ pub const BPTree = struct {
 
     /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
     fn getPage(self: *BPTree, pgno: u32) !Page {
-        if (pgno == meta_pgno or pgno >= @atomicLoad(u32, &self.npages, .monotonic)) return error.BadFile;
-        return self.pool.pin(pgno, .load);
+        return self.getPageWith(pgno, null);
     }
 
     fn getPageWith(self: *BPTree, pgno: u32, ring: ?*Ring) !Page {
@@ -1279,6 +1253,13 @@ pub const BPTree = struct {
         return p;
     }
 
+    /// Puts `p` at the head of the free list. The caller holds `alloc_mu`, or no other thread runs.
+    fn pushFree(self: *BPTree, p: Page) void {
+        p.init(.free);
+        p.setLink(self.freelist);
+        self.freelist = p.pgno;
+    }
+
     fn commit(self: *BPTree, op: *Op) void {
         if (op.changed.len > 0) {
             const root = if (op.root_latch == .exclusive) self.root else 0;
@@ -1287,10 +1268,7 @@ pub const BPTree = struct {
         }
         if (op.freed.len > 0) {
             self.alloc_mu.lockUncancelable(self.pool.io);
-            for (op.freed.items()) |p| {
-                p.setLink(self.freelist);
-                self.freelist = p.pgno;
-            }
+            for (op.freed.items()) |p| self.pushFree(p);
             self.alloc_mu.unlock(self.pool.io);
         }
     }
@@ -1426,24 +1404,19 @@ pub const BPTree = struct {
     }
 
     pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
-        if (key.len > max_key) return error.KeyTooLarge;
-        self.gate.lockSharedUncancelable(self.pool.io);
-        defer self.gate.unlockShared(self.pool.io);
-        var op: Op = .{};
-        const path = try self.descend(&op, key, .read);
-        defer self.releaseHeld(&op);
-        const leaf = path.leaf();
-        const r = leaf.search(key);
-        if (r.found) {
-            const len = leaf.valLen(r.index);
-            if (out.len < len) return error.NoSpaceLeft;
-            try self.readValue(leaf, r.index, out[0..len]);
-            return out[0..len];
-        }
-        return null;
+        return self.lookup(key, .{ .buf = out });
     }
 
     pub fn getAlloc(self: *BPTree, gpa: Allocator, key: []const u8) !?[]u8 {
+        return self.lookup(key, .{ .alloc = gpa });
+    }
+
+    const Out = union(enum) {
+        buf: []u8,
+        alloc: Allocator,
+    };
+
+    fn lookup(self: *BPTree, key: []const u8, out: Out) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
         self.gate.lockSharedUncancelable(self.pool.io);
         defer self.gate.unlockShared(self.pool.io);
@@ -1453,10 +1426,14 @@ pub const BPTree = struct {
         const leaf = path.leaf();
         const r = leaf.search(key);
         if (!r.found) return null;
-        const out = try gpa.alloc(u8, leaf.valLen(r.index));
-        errdefer gpa.free(out);
-        try self.readValue(leaf, r.index, out);
-        return out;
+        const len = leaf.valLen(r.index);
+        const val = switch (out) {
+            .buf => |b| if (b.len < len) return error.NoSpaceLeft else b[0..len],
+            .alloc => |gpa| try gpa.alloc(u8, len),
+        };
+        errdefer if (out == .alloc) out.alloc.free(val);
+        try self.readValue(leaf, r.index, val);
+        return val;
     }
 
     fn readValue(self: *BPTree, leaf: Page, i: usize, out: []u8) !void {
@@ -1517,10 +1494,8 @@ pub const BPTree = struct {
                 return error.BadFile;
             }
             pg = p.link();
-            p.init(.free);
             self.alloc_mu.lockUncancelable(self.pool.io);
-            p.setLink(self.freelist);
-            self.freelist = p.pgno;
+            self.pushFree(p);
             self.alloc_mu.unlock(self.pool.io);
             self.pool.unpin(p, .{ .logged = lsn });
         }
@@ -1550,21 +1525,9 @@ pub const BPTree = struct {
         }
         if (idx == p.count()) cl.add(c);
 
-        const leaf = p.kind() == .leaf;
-        const s = cl.chooseSplit(leaf);
         const right = takeSpare(op, p.kind());
-        const right_pg = right.pgno;
-        var sep_buf: [max_key + 6]u8 = undefined;
-        const sep = if (leaf) blk: {
-            right.fill(.leaf, p.link(), cl, s, cl.cells.len);
-            p.fill(.leaf, right_pg, cl, 0, s);
-            break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
-        } else blk: {
-            const mid = cl.cells.items()[s];
-            right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
-            p.fill(.internal, p.link(), cl, 0, s);
-            break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
-        };
+        var sep_buf: [max_internal_cell]u8 = undefined;
+        const sep = spread(cl, p, right, p.link(), &sep_buf);
         op.markChanged(right);
         op.markChanged(p);
 
@@ -1579,6 +1542,21 @@ pub const BPTree = struct {
             _ = self.insertUp(op, path, d - 1, path[d - 1].idx, sep);
         }
         return true;
+    }
+
+    /// Splits the cells of `cl` evenly between `left` and `right`, and returns the separator for the parent.
+    /// `next` is the leaf after the two, for a leaf split.
+    fn spread(cl: *const CellList, left: Page, right: Page, next: u32, sep_buf: *[max_internal_cell]u8) []const u8 {
+        const s = cl.chooseSplit(left.kind() == .leaf);
+        if (left.kind() == .leaf) {
+            right.fill(.leaf, next, cl, s, cl.cells.len);
+            left.fill(.leaf, right.pgno, cl, 0, s);
+            return makeInternalCell(sep_buf, right.pgno, right.cellKey(0));
+        }
+        const mid = cl.cells.items()[s];
+        left.fill(.internal, left.link(), cl, 0, s);
+        right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
+        return makeInternalCell(sep_buf, right.pgno, mid[6..][0..get16(mid[4..])]);
     }
 
     fn putIn(self: *BPTree, op: *Op, key: []const u8, cell: []const u8, how: Descent) !bool {
@@ -1630,6 +1608,11 @@ pub const BPTree = struct {
             if (first != 0) try self.freeChain(first, 0);
             return err;
         };
+        try self.endWrite(&op);
+    }
+
+    /// Frees the chain of the old value after the commit, and waits for the commit if `durable`.
+    fn endWrite(self: *BPTree, op: *const Op) !void {
         if (op.old_chain != 0) try self.freeChain(op.old_chain, op.lsn);
         if (self.durable) try self.pool.wal.flushTo(self.pool.io, op.lsn);
     }
@@ -1669,7 +1652,7 @@ pub const BPTree = struct {
         cl.addPage(left);
         if (!leaf) {
             const k = parent.cellKey(sep_idx);
-            var c: [max_key + 6]u8 = undefined;
+            var c: [max_internal_cell]u8 = undefined;
             cl.add(makeInternalCell(&c, right.link(), k));
         }
         cl.addPage(right);
@@ -1687,19 +1670,8 @@ pub const BPTree = struct {
         }
 
         // split evenly
-        const s = cl.chooseSplit(leaf);
-        var sep_buf: [max_key + 6]u8 = undefined;
-        const right_pg = right.pgno;
-        const sep = if (leaf) blk: {
-            left.fill(.leaf, right_pg, cl, 0, s);
-            right.fill(.leaf, right.link(), cl, s, cl.cells.len);
-            break :blk makeInternalCell(&sep_buf, right_pg, right.cellKey(0));
-        } else blk: {
-            const mid = cl.cells.items()[s];
-            left.fill(.internal, left.link(), cl, 0, s);
-            right.fill(.internal, get32(mid), cl, s + 1, cl.cells.len);
-            break :blk makeInternalCell(&sep_buf, right_pg, mid[6..][0..get16(mid[4..])]);
-        };
+        var sep_buf: [max_internal_cell]u8 = undefined;
+        const sep = spread(cl, left, right, right.link(), &sep_buf);
         op.markChanged(left);
         op.markChanged(right);
         parent.deleteCell(sep_idx);
@@ -1740,8 +1712,7 @@ pub const BPTree = struct {
         defer self.gate.unlockShared(self.pool.io);
         var op: Op = .{};
         const found = try self.deleteIn(&op, key, .optimistic) orelse (try self.deleteIn(&op, key, .write)).?;
-        if (op.old_chain != 0) try self.freeChain(op.old_chain, op.lsn);
-        if (self.durable) try self.pool.wal.flushTo(self.pool.io, op.lsn);
+        try self.endWrite(&op);
         return found;
     }
 
@@ -1763,7 +1734,7 @@ pub const BPTree = struct {
         var ring: Ring = .{};
         var big: []u8 = &.{};
         defer self.gpa.free(big);
-        const use_ring = build_options.scan_ring and ring_frames > 0 and @atomicLoad(u32, &self.npages, .monotonic) > pool_frames / 4;
+        const use_ring = ring_frames > 0 and @atomicLoad(u32, &self.npages, .monotonic) > pool_frames / 4;
 
         restart: while (true) {
             var op: Op = .{};
@@ -1946,7 +1917,7 @@ const Page = struct {
         return get32(self.page[8..12]);
     }
 
-    fn setN(self: Page, n: usize) void {
+    fn setCount(self: Page, n: usize) void {
         put16(self.page[2..], @intCast(n));
     }
     fn setCellStart(self: Page, v: usize) void {
@@ -1975,13 +1946,8 @@ const Page = struct {
     }
     fn cellKey(self: Page, i: usize) []const u8 {
         const c = self.cell(i);
-        if (self.kind() == .leaf) {
-            const klen = get16(c);
-            return c[6..][0..klen];
-        } else {
-            const klen = get16(c[4..]);
-            return c[6..][0..klen];
-        }
+        const klen = if (self.kind() == .leaf) get16(c) else get16(c[4..]);
+        return c[6..][0..klen];
     }
 
     fn valLen(self: Page, i: usize) u32 {
@@ -2075,7 +2041,7 @@ const Page = struct {
         const s = (2 * (n - idx));
         @memmove(self.page[hdr_size + 2 * (idx + 1) ..][0..s], self.page[hdr_size + 2 * idx ..][0..s]);
         self.setSlot(idx, off);
-        self.setN(n + 1);
+        self.setCount(n + 1);
         return true;
     }
 
@@ -2090,7 +2056,7 @@ const Page = struct {
         }
         const s = 2 * (n - idx - 1);
         @memmove(self.page[hdr_size + 2 * idx ..][0..s], self.page[hdr_size + 2 * (idx + 1) ..][0..s]);
-        self.setN(n - 1);
+        self.setCount(n - 1);
     }
 
     fn childIndex(self: Page, key: []const u8) usize {
@@ -2209,14 +2175,10 @@ fn closeTestLog(log: [2]Io.File) void {
 }
 
 test BPTree {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     try t.metaWrite(.{ .epoch = 5, .root = 1, .npages = 2, .freelist = 0 });
     try t.metaRead();
@@ -2225,31 +2187,25 @@ test BPTree {
     try t.metaWrite(.{ .epoch = 6, .root = 1, .npages = 2, .freelist = 0 });
     try t.metaRead();
     try std.testing.expectEqual(6, t.pool.wal.epoch);
-    try file.writePositionalAll(std.testing.io, "x", 3);
+    try tt.file.writePositionalAll(std.testing.io, "x", 3);
     try t.metaRead();
     try std.testing.expectEqual(5, t.pool.wal.epoch);
 }
 
 test "BPTree sync and reopen" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;
     const N = 500;
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     {
-        var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         try t.sync();
     }
     // A new tree has an empty pool, so it reads all pages from the file.
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    try tt.crash();
     for (0..N) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
         try std.testing.expectEqualStrings("value", (try t.get(k, &out)).?);
@@ -2257,28 +2213,22 @@ test "BPTree sync and reopen" {
 }
 
 test "BPTree recovers after a crash" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;
     const N = 2000;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         for (0..N) |i| {
             if (i % 3 == 0) _ = try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}));
         }
         // No sync: deinit drops the pool, as a crash would. Some pages reached the file and some did not.
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     try t.check();
     for (0..N) |i| {
         const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out);
@@ -2288,27 +2238,23 @@ test "BPTree recovers after a crash" {
 
 test "BPTree sync starts a new run and empties the file of the run before" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     t.ckpt_bytes = 0;
 
     var kbuf: [16]u8 = undefined;
     for (0..3) |_| {
         const e = t.pool.wal.epoch;
         for (0..100) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
-        try std.testing.expect(try log[e % 2].length(io) > 0);
+        try std.testing.expect(try tt.log[e % 2].length(io) > 0);
         try t.sync();
         // The new run is in the other file. The file of run `e` is empty, and so is the new run.
         try std.testing.expectEqual(e + 1, t.pool.wal.epoch);
-        try std.testing.expectEqual(0, try log[e % 2].length(io));
+        try std.testing.expectEqual(0, try tt.log[e % 2].length(io));
         try std.testing.expectEqual(t.pool.wal.start.raw, t.pool.wal.end.raw);
-        try std.testing.expectEqual(0, try log[(e + 1) % 2].length(io));
+        try std.testing.expectEqual(0, try tt.log[(e + 1) % 2].length(io));
         try t.metaRead();
         try std.testing.expectEqual(e + 1, t.pool.wal.epoch);
     }
@@ -2330,27 +2276,22 @@ fn testExpect(t: *BPTree, n: usize, val: []const u8) !void {
 
 test "BPTree recovery reads the run after a checkpoint that did not end" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 1000;
     var e: u32 = undefined;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
         t.ckpt_bytes = 0;
         e = t.pool.wal.epoch;
-        try testPut(&t, N, "one");
+        try testPut(t, N, "one");
         // A checkpoint starts run e + 1, and then the process crashes before the meta page.
         _ = try t.pool.wal.nextRun(io);
-        try testPut(&t, N, "two");
+        try testPut(t, N, "two");
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
-    try testExpect(&t, N, "two");
+    try tt.crash();
+    try testExpect(t, N, "two");
     // The meta page is in the slot that run e did not use, so a torn write of it leaves the meta page of run e.
     const now = t.pool.wal.epoch;
     try std.testing.expect(now > e + 1 and now % 2 != e % 2);
@@ -2360,19 +2301,15 @@ test "BPTree recovery reads the run after a checkpoint that did not end" {
 
 test "BPTree recovery never joins old records of a run" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 20;
     var old: []u8 = undefined;
     var f: usize = undefined;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
-        try testPut(&t, N, "one");
+        try testPut(t, N, "one");
         const off = t.pool.wal.end.raw - t.pool.wal.start.raw;
         const prev = t.pool.wal.file();
         // A checkpoint starts run e + 1 and logs two operations into it: a harmless page, and then a page that
@@ -2384,22 +2321,20 @@ test "BPTree recovery never joins old records of a run" {
         _ = try t.pool.wal.append(io, &.{.{ .page = &junk, .pgno = t.root }}, 0);
         try prev.writePositionalAll(io, "x", off + 10);
         f = t.pool.wal.epoch % 2;
-        old = try std.testing.allocator.alloc(u8, try log[f].length(io));
-        _ = try log[f].readPositionalAll(io, old, 0);
+        old = try std.testing.allocator.alloc(u8, try tt.log[f].length(io));
+        _ = try tt.log[f].readPositionalAll(io, old, 0);
     }
     defer std.testing.allocator.free(old);
+    try tt.crash();
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
-        try testExpect(&t, N, "one");
+        try testExpect(t, N, "one");
         // Recovery emptied that file. A power cut can lose that cut and leave the old records there.
-        try log[f].writePositionalAll(io, old, 0);
+        try tt.log[f].writePositionalAll(io, old, 0);
         // One put logs one page and a commit, as the harmless operation did, so its records end where the
         // junk starts. A record of the new run must not be followed by an old record.
         try t.put("key00000000", "two");
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     try t.check();
     var out: [max_local]u8 = undefined;
     try std.testing.expectEqualStrings("two", (try t.get("key00000000", &out)).?);
@@ -2407,17 +2342,13 @@ test "BPTree recovery never joins old records of a run" {
 
 test "BPTree recovery stops at a torn next record" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 1000;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
-        try testPut(&t, N, "one");
+        try testPut(t, N, "one");
         const off = t.pool.wal.end.raw - t.pool.wal.start.raw;
         const old = t.pool.wal.file();
         _ = try t.pool.wal.nextRun(io);
@@ -2426,9 +2357,8 @@ test "BPTree recovery stops at a torn next record" {
         _ = try t.pool.wal.append(io, &.{.{ .page = &junk, .pgno = t.root }}, 0);
         try old.writePositionalAll(io, "x", off + 10);
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
-    try testExpect(&t, N, "one");
+    try tt.crash();
+    try testExpect(t, N, "one");
 }
 
 const CkptTest = struct {
@@ -2470,44 +2400,35 @@ const CkptTest = struct {
 
 test "BPTree checkpoint while other threads write" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const rounds = 8;
     var e: u32 = undefined;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
         e = t.pool.wal.epoch;
-        var c: CkptTest = .{ .t = &t };
+        var c: CkptTest = .{ .t = t };
         try std.testing.expect(try c.run(rounds) > 0);
-        try testExpect(&t, CkptTest.keys, "v7");
+        try testExpect(t, CkptTest.keys, "v7");
         // After the last checkpoint, the file of the run before is empty.
-        try std.testing.expectEqual(0, try log[(t.pool.wal.epoch + 1) % 2].length(io));
+        try std.testing.expectEqual(0, try tt.log[(t.pool.wal.epoch + 1) % 2].length(io));
         // More changes after the last checkpoint, and then a crash.
-        try testPut(&t, CkptTest.keys, "after");
+        try testPut(t, CkptTest.keys, "after");
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
-    try testExpect(&t, CkptTest.keys, "after");
+    try tt.crash();
+    try testExpect(t, CkptTest.keys, "after");
     try std.testing.expect(t.pool.wal.epoch > e + 3);
 }
 
 test "BPTree checkpoint waits for the operations that run" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
-        try testPut(&t, 10, "one");
+        try testPut(t, 10, "one");
         // Now no page is dirty.
         try t.sync();
 
@@ -2526,30 +2447,25 @@ test "BPTree checkpoint waits for the operations that run" {
                 _ = tree.checkpoint() catch |err| std.debug.panic("checkpoint: {t}", .{err});
             }
         };
-        const th = try std.Thread.spawn(.{}, C.run, .{&t});
+        const th = try std.Thread.spawn(.{}, C.run, .{t});
         try io.sleep(.fromMilliseconds(50), .awake);
         t.pool.unpin(p, .{ .logged = lsn });
         t.gate.unlockShared(io);
         th.join();
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     var out: [max_local]u8 = undefined;
     try std.testing.expectEqualStrings("two", (try t.get("key00000000", &out)).?);
 }
 
 test "BPTree checkpoint keeps the root of its run start" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
-        try testPut(&t, 10, "one");
+        try testPut(t, 10, "one");
         const root = t.root;
 
         // Pin the dirty root leaf, so that the checkpoint waits for it after its run starts.
@@ -2559,7 +2475,7 @@ test "BPTree checkpoint keeps the root of its run start" {
                 _ = tree.checkpoint() catch |err| std.debug.panic("checkpoint: {t}", .{err});
             }
         };
-        const th = try std.Thread.spawn(.{}, C.run, .{&t});
+        const th = try std.Thread.spawn(.{}, C.run, .{t});
         try io.sleep(.fromMilliseconds(50), .awake);
         // Now an operation splits the root: it sets the new root before it logs its pages and commits.
         // Then the power goes off before the commit.
@@ -2568,24 +2484,18 @@ test "BPTree checkpoint keeps the root of its run start" {
         th.join();
         t.root = root;
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
-    try testExpect(&t, 10, "one");
+    try tt.crash();
+    try testExpect(t, 10, "one");
 }
 
 test "BPTree crash right after a checkpoint" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 4000;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
-        try testPut(&t, N, "one");
+        try testPut(t, N, "one");
         for (0..N) |i| {
             var kbuf: [16]u8 = undefined;
             if (i < N * 3 / 4) _ = try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}));
@@ -2596,8 +2506,7 @@ test "BPTree crash right after a checkpoint" {
         // The new run is empty, so recovery has no record to read.
         try std.testing.expectEqual(t.pool.wal.start.raw, t.pool.wal.end.raw);
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     try t.check();
     // The meta page holds the free list of the run start, with the pages that the deletes freed.
     try std.testing.expect(t.freelist != 0);
@@ -2611,41 +2520,33 @@ test "BPTree crash right after a checkpoint" {
 
 test "BPTree automatic checkpoints keep the log short" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const limit = 64 * (Wal.rec_hdr + page_size);
     const N = 3000;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
         t.ckpt_bytes = limit;
         for (0..4) |round| {
             var vbuf: [8]u8 = undefined;
-            try testPut(&t, N, try std.fmt.bufPrint(&vbuf, "v{d}", .{round}));
+            try testPut(t, N, try std.fmt.bufPrint(&vbuf, "v{d}", .{round}));
             // An operation that starts a checkpoint ran when the run had at least `limit` bytes. One operation
             // logs at most `max_changed` pages, so no file can have much more.
-            for (log) |l| try std.testing.expect(try l.length(io) < limit + (max_changed + 1) * (Wal.rec_hdr + page_size));
+            for (tt.log) |l| try std.testing.expect(try l.length(io) < limit + (max_changed + 1) * (Wal.rec_hdr + page_size));
         }
         try std.testing.expect(t.checkpoints.load(.monotonic) > 4);
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
-    try testExpect(&t, N, "v3");
+    try tt.crash();
+    try testExpect(t, N, "v3");
 }
 
 test "BPTree recovers values with chains after a crash" {
-    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     const N = 60;
     const lens = [_]usize{ 20, max_local + 1, 2 * ovfl_cap + 7 };
@@ -2655,8 +2556,6 @@ test "BPTree recovers values with chains after a crash" {
     defer gpa.free(out);
     var kbuf: [16]u8 = undefined;
     {
-        var t: BPTree = try .init(gpa, io, file, log);
-        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, lens[i % 3], 1));
         try t.sync();
         // After the sync: replace a third, delete a third. Old chains go to the free list, new chains come from it.
@@ -2669,8 +2568,7 @@ test "BPTree recovers values with chains after a crash" {
         _ = try t.writeChain(testValue(vbuf, lens[2], 9));
         // No sync: deinit drops the pool, as a crash would.
     }
-    var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     // The orphan chain is on the free list, and no page of a live chain is.
     try t.check();
     for (0..N) |i| {
@@ -2685,16 +2583,10 @@ test "BPTree recovers values with chains after a crash" {
 
 test "BPTree freed chain page waits for the commit that freed it" {
     if (build_options.pool_paranoid) return error.SkipZigTest;
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     const big: [2 * ovfl_cap]u8 = @splat('b');
     try t.put("k", &big);
@@ -2724,27 +2616,22 @@ test "BPTree freed chain page waits for the commit that freed it" {
 
 test "BPTree recovery ignores an operation that did not commit" {
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;
     const N = 500;
     {
-        var t: BPTree = try .init(std.testing.allocator, io, file, log);
-        defer t.deinit();
         for (0..N) |i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), "value");
         // An operation that crashed after it logged an image of the root, but before its commit record.
         var junk: [page_size]u8 = @splat(0xEE);
         const end = try t.pool.wal.append(io, &.{.{ .page = &junk }}, 0);
         try t.pool.wal.file().setLength(io, end - t.pool.wal.start.raw - Wal.rec_hdr);
     }
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     try t.check();
     for (0..N) |i| try std.testing.expectEqualStrings("value", (try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out)).?);
 }
@@ -2923,14 +2810,10 @@ test "Page leaf cell with overflow" {
 }
 
 test Pool {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     t.npages = pool_frames + 4;
     for (1..t.npages) |pg| {
@@ -2958,15 +2841,11 @@ fn testRingPin(pool: *Pool, pgno: u32, ring: *Ring) !usize {
 test "Pool ring" {
     // With a max_usage of 1, a ring cannot see that another reader used one of its frames.
     if (build_options.pool_paranoid or ring_frames < 2 or max_usage < 2) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
-    testEmptyPool(&t);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    testEmptyPool(t);
     const pool = &t.pool;
 
     // The first misses of a scan fill the ring from the clock sweep. Then the scan reuses the ring.
@@ -3000,15 +2879,11 @@ test "Pool ring" {
 
 test "Pool ring drops a frame whose write must force the log" {
     if (build_options.pool_paranoid or ring_frames < 2) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
-    testEmptyPool(&t);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    testEmptyPool(t);
     const pool = &t.pool;
 
     var ring: Ring = .{};
@@ -3034,16 +2909,11 @@ test "Pool ring drops a frame whose write must force the log" {
 
 test "BPTree large scan keeps a hot path in the pool" {
     // A scan holds two leaves at a time, so a ring of one frame cannot reuse its frame.
-    if (build_options.pool_paranoid or !build_options.scan_ring or ring_frames < 2) return error.SkipZigTest;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, io, file, log);
-    defer t.deinit();
+    if (build_options.pool_paranoid or ring_frames < 2) return error.SkipZigTest;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;
@@ -3067,14 +2937,10 @@ test "BPTree large scan keeps a hot path in the pool" {
 }
 
 test "BPTree page alloc" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     // open allocates the root leaf as page 1.
     try std.testing.expectEqual(1, t.root);
@@ -3132,15 +2998,11 @@ fn testSetUsage(fr: *Frame, usage: u4) void {
 
 test "Pool usage count" {
     if (build_options.pool_paranoid) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
-    testEmptyPool(&t);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    testEmptyPool(t);
 
     // A miss gives a usage count of 1, and each pin of the page in the pool adds 1, up to max_usage.
     try testPin(&t.pool, 1);
@@ -3165,15 +3027,11 @@ test "Pool usage count" {
 test "Pool clock sweep" {
     // The test gives page 1 a usage count of 3.
     if (build_options.pool_paranoid or max_usage < 3) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
-    testEmptyPool(&t);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    testEmptyPool(t);
 
     // An empty frame has no pins and a usage count of 0, so the sweep takes the empty frames in order.
     // Pages 1 to pool_frames fill them, each with a usage count of 1, and the hand goes round once.
@@ -3204,15 +3062,11 @@ test "Pool clock sweep" {
 
 test "Pool clock sweep skips pinned frames" {
     if (build_options.pool_paranoid) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
-    testEmptyPool(&t);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    testEmptyPool(t);
 
     var pinned: [pool_frames]Page = undefined;
     for (&pinned, 1..) |*p, pg| p.* = try t.pool.pin(@intCast(pg), .no_load);
@@ -3233,15 +3087,11 @@ test "Pool clock sweep skips pinned frames" {
 
 test "Pool miss gives up a victim that another thread pinned" {
     if (build_options.pool_paranoid) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
-    testEmptyPool(&t);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    testEmptyPool(t);
     const pool = &t.pool;
 
     // Page 1 is in frame 0 with a usage count of 0. With the hand back on frame 0, the sweep takes it and pins it.
@@ -3268,14 +3118,10 @@ test "Pool miss gives up a victim that another thread pinned" {
 }
 
 test "BPTree get" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     // Make a two-level tree by hand: the root holds "m", with "a" on the left and "m", "z" on the right.
     var cell: [page_size]u8 = undefined;
@@ -3357,14 +3203,10 @@ test CellList {
 }
 
 test "BPTree put get delete" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     const N = 2000;
     var order: [N]usize = undefined;
@@ -3431,14 +3273,11 @@ fn testValue(buf: []u8, len: usize, seed: u8) []u8 {
 }
 
 test "BPTree large values" {
-    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     // Lengths around each edge, and one chain longer than the pool.
     const lens = [_]usize{ 0, 1, max_local, max_local + 1, min_local + ovfl_cap, min_local + ovfl_cap + 1, 3 * ovfl_cap, (pool_frames + 3) * ovfl_cap + 5 };
@@ -3448,8 +3287,6 @@ test "BPTree large values" {
     defer gpa.free(out);
     var kbuf: [16]u8 = undefined;
     {
-        var t: BPTree = try .init(gpa, io, file, log);
-        defer t.deinit();
         for (lens, 0..) |len, i| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), testValue(vbuf, len, @intCast(i)));
         try t.check();
         // Each chain has just enough pages: the root leaf and the chains are all the pages of the tree.
@@ -3459,8 +3296,7 @@ test "BPTree large values" {
         try t.sync();
     }
     // A new tree reads all pages from the file.
-    var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit();
+    try tt.crash();
     for (lens, 0..) |len, i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i});
         const want = testValue(vbuf, len, @intCast(i));
@@ -3487,16 +3323,11 @@ test "BPTree large values" {
 }
 
 test "BPTree replace and delete free chains" {
-    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     const lens = [_]usize{ 10, max_local + 1, 2 * ovfl_cap, 5 * ovfl_cap };
     const vbuf = try gpa.alloc(u8, lens[lens.len - 1]);
@@ -3540,16 +3371,10 @@ test "BPTree replace and delete free chains" {
 
 test "BPTree failed put frees its new chain" {
     if (pool_frames < 4) return error.SkipZigTest;
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(gpa, io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     // Fill the root leaf with small values, so that the cell of the big value splits it.
     const huge: [3 * ovfl_cap]u8 = @splat('h');
@@ -3580,14 +3405,10 @@ test "BPTree failed put frees its new chain" {
 }
 
 test "BPTree scan" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
 
     // Only the odd numbers, so that a bound can fall between two keys.
     const N = 2000;
@@ -3656,14 +3477,10 @@ test "BPTree scan" {
 }
 
 test "BPTree failed operation does not change the tree" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     t.ckpt_bytes = 0;
 
     var kbuf: [16]u8 = undefined;
@@ -3711,13 +3528,13 @@ test "BPTree failed operation does not change the tree" {
     var failed_puts: usize = 0;
     for (0..n) |i| {
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>8}x", .{i});
-        const count = try Pinner.pinAllBut(&t, k, &pinned);
+        const count = try Pinner.pinAllBut(t, k, &pinned);
         const npages = t.npages;
         const freelist = t.freelist;
         const root = t.root;
         const result = t.put(k, &big);
         try std.testing.expectEqual(count, t.pool.pinned());
-        Pinner.unpinAll(&t, pinned[0..count]);
+        Pinner.unpinAll(t, pinned[0..count]);
         if (result) |_| continue else |err| try std.testing.expectEqual(error.PoolExhausted, err);
         failed_puts += 1;
         try std.testing.expectEqual(null, try t.get(k, &out));
@@ -3737,10 +3554,10 @@ test "BPTree failed operation does not change the tree" {
             try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{j / 2})
         else
             try std.fmt.bufPrint(&kbuf, "key{d:0>8}x", .{j / 2});
-        const count = try Pinner.pinAllBut(&t, k, &pinned);
+        const count = try Pinner.pinAllBut(t, k, &pinned);
         const result = t.delete(k);
         try std.testing.expectEqual(count, t.pool.pinned());
-        Pinner.unpinAll(&t, pinned[0..count]);
+        Pinner.unpinAll(t, pinned[0..count]);
         if (result) |found| {
             try std.testing.expect(found);
             continue;
@@ -3765,14 +3582,10 @@ test "BPTree failed operation does not change the tree" {
 test "BPTree pool lock count" {
     if (build_options.pool_paranoid) return error.SkipZigTest;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try createTestFile(tmp.dir);
-    defer file.close(std.testing.io);
-    const log = try createTestLog(tmp.dir);
-    defer closeTestLog(log);
-    var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
-    defer t.deinit();
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     t.durable = false;
 
     var kbuf: [16]u8 = undefined;
@@ -3807,8 +3620,8 @@ test "BPTree pool lock count" {
     for (fewest) |f| try std.testing.expectEqual(levels, f);
 }
 
-/// A tree for the vacuum tests, in a file of a test directory.
-const VacTest = struct {
+/// A tree for the tests, in a file of a test directory.
+const TestTree = struct {
     tmp: std.testing.TmpDir,
     file: Io.File,
     log: [2]Io.File,
@@ -3819,7 +3632,7 @@ const VacTest = struct {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    fn init(self: *VacTest) !void {
+    fn init(self: *TestTree) !void {
         self.tmp = std.testing.tmpDir(.{});
         self.file = try createTestFile(self.tmp.dir);
         self.log = try createTestLog(self.tmp.dir);
@@ -3828,7 +3641,7 @@ const VacTest = struct {
         self.out = try gpa.alloc(u8, 4 * ovfl_cap);
     }
 
-    fn deinit(self: *VacTest) void {
+    fn deinit(self: *TestTree) void {
         self.t.deinit();
         gpa.free(self.vbuf);
         gpa.free(self.out);
@@ -3838,16 +3651,16 @@ const VacTest = struct {
     }
 
     /// Drops the pool, as a crash would, and opens the tree again.
-    fn crash(self: *VacTest) !void {
+    fn crash(self: *TestTree) !void {
         self.t.deinit();
         self.t = try .init(gpa, io, self.file, self.log);
     }
 
-    fn fileLen(self: *VacTest) !u64 {
+    fn fileLen(self: *TestTree) !u64 {
         return self.file.length(io);
     }
 
-    fn freePages(self: *VacTest) !u32 {
+    fn freePages(self: *TestTree) !u32 {
         var n: u32 = 0;
         var pg = self.t.freelist;
         while (pg != 0) : (n += 1) {
@@ -3871,7 +3684,7 @@ const VacTest = struct {
     /// Puts keys `0..n`, and then deletes the keys that `keep` rejects, in a random order.
     /// Before the keys, a value with a chain of 128 pages takes the start of the file. Its delete at the end
     /// frees those pages, so that the root and the other pages of the tree are near the end of the file.
-    fn fill(self: *VacTest, n: usize, comptime keep: fn (usize) bool) !void {
+    fn fill(self: *TestTree, n: usize, comptime keep: fn (usize) bool) !void {
         const front = try gpa.alloc(u8, 128 * ovfl_cap);
         defer gpa.free(front);
         try self.t.put("!", testValue(front, front.len, 0));
@@ -3889,7 +3702,7 @@ const VacTest = struct {
     }
 
     /// Checks the tree, and that keys `0..n` are in it if `keep` accepts them.
-    fn expect(self: *VacTest, n: usize, comptime keep: fn (usize) bool) !void {
+    fn expect(self: *TestTree, n: usize, comptime keep: fn (usize) bool) !void {
         try self.t.check();
         var kbuf: [key_len]u8 = undefined;
         for (0..n) |i| {
@@ -3902,15 +3715,15 @@ const VacTest = struct {
 };
 
 test "BPTree vacuum truncates the free tail" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     try t.put("a", "1");
     const small = t.npages;
 
     // Three values of 4 pages each. The chains take new pages at the end of the file, in order.
-    for ("xyz", 0..) |c, i| try t.put(&.{c}, testValue(vt.vbuf, 4 * ovfl_cap, @intCast(i)));
+    for ("xyz", 0..) |c, i| try t.put(&.{c}, testValue(tt.vbuf, 4 * ovfl_cap, @intCast(i)));
     try std.testing.expectEqual(small + 12, t.npages);
     // The free list: the pages of "x", then the pages of "z".
     try std.testing.expect(try t.delete("z"));
@@ -3920,20 +3733,20 @@ test "BPTree vacuum truncates the free tail" {
     // The last page of "x" on the list gets a link of 0.
     const s = try t.vacuum(.truncate);
     try std.testing.expectEqual(BPTree.VacuumStats{ .before = small + 12, .after = small + 8, .moved = 0 }, s);
-    try std.testing.expectEqual(@as(u64, t.npages) * page_size, try vt.fileLen());
-    try std.testing.expectEqual(4, try vt.freePages());
+    try std.testing.expectEqual(@as(u64, t.npages) * page_size, try tt.fileLen());
+    try std.testing.expectEqual(4, try tt.freePages());
     try t.check();
     // Nothing more is at the end.
     try std.testing.expectEqual(BPTree.VacuumStats{ .before = small + 8, .after = small + 8, .moved = 0 }, try t.vacuum(.truncate));
 
     // The file stays short when the tree is open again, and the new free list works.
-    try vt.crash();
+    try tt.crash();
     try std.testing.expectEqual(small + 8, t.npages);
     try t.check();
-    try std.testing.expectEqualSlices(u8, testValue(vt.vbuf, 4 * ovfl_cap, 1), (try t.get("y", vt.out)).?);
-    try t.put("x", testValue(vt.vbuf, 4 * ovfl_cap, 0));
+    try std.testing.expectEqualSlices(u8, testValue(tt.vbuf, 4 * ovfl_cap, 1), (try t.get("y", tt.out)).?);
+    try t.put("x", testValue(tt.vbuf, 4 * ovfl_cap, 0));
     try std.testing.expectEqual(small + 8, t.npages);
-    try std.testing.expectEqual(0, try vt.freePages());
+    try std.testing.expectEqual(0, try tt.freePages());
     try t.check();
 }
 
@@ -3951,14 +3764,14 @@ fn keepAll(_: usize) bool {
 }
 
 test "BPTree vacuum moves pages to the free pages" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     const before = t.npages;
-    const nfree = try vt.freePages();
+    const nfree = try tt.freePages();
     try std.testing.expect(nfree > before / 2);
 
     const s = try t.vacuum(.full);
@@ -3967,105 +3780,105 @@ test "BPTree vacuum moves pages to the free pages" {
     try std.testing.expect(s.moved > 0);
     // No free page is left, so check shows that each page below npages is in the tree.
     try std.testing.expectEqual(0, t.freelist);
-    try std.testing.expectEqual(@as(u64, s.after) * page_size, try vt.fileLen());
-    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(@as(u64, s.after) * page_size, try tt.fileLen());
+    try tt.expect(N, keepThird);
     try std.testing.expectEqual(BPTree.VacuumStats{ .before = s.after, .after = s.after, .moved = 0 }, try t.vacuum(.full));
 
-    try vt.crash();
+    try tt.crash();
     try std.testing.expectEqual(s.after, t.npages);
-    try vt.expect(N, keepThird);
+    try tt.expect(N, keepThird);
     // The tree grows again from the new end of the file.
-    var kbuf: [VacTest.key_len]u8 = undefined;
-    for (0..N) |i| if (!keepThird(i)) try t.put(VacTest.key(&kbuf, i), testValue(vt.vbuf, vacLen(i), @truncate(i)));
-    try vt.expect(N, keepAll);
+    var kbuf: [TestTree.key_len]u8 = undefined;
+    for (0..N) |i| if (!keepThird(i)) try t.put(TestTree.key(&kbuf, i), testValue(tt.vbuf, vacLen(i), @truncate(i)));
+    try tt.expect(N, keepAll);
 }
 
 test "BPTree vacuum moves the root" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     const root = t.root;
     const s = try t.vacuum(.full);
     try std.testing.expect(root >= s.after);
     try std.testing.expect(t.root < s.after);
-    try vt.expect(N, keepThird);
-    try vt.crash();
-    try vt.expect(N, keepThird);
+    try tt.expect(N, keepThird);
+    try tt.crash();
+    try tt.expect(N, keepThird);
 }
 
 test "BPTree incremental vacuum" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     const before = t.npages;
-    const nfree = try vt.freePages();
+    const nfree = try tt.freePages();
 
     // Each step makes the file at least 7 pages shorter: more if the pages before the cut are free too.
     // The free pages below the new end stay on the free list.
     var s = try t.vacuum(.{ .incremental = 7 });
     try std.testing.expect(s.after <= before - 7);
-    try std.testing.expectEqual(nfree - (before - s.after), try vt.freePages());
-    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(nfree - (before - s.after), try tt.freePages());
+    try tt.expect(N, keepThird);
     const first = s.after;
     s = try t.vacuum(.{ .incremental = 7 });
     try std.testing.expect(s.after <= first - 7);
-    try std.testing.expectEqual(nfree - (before - s.after), try vt.freePages());
-    try std.testing.expectEqual(@as(u64, s.after) * page_size, try vt.fileLen());
-    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(nfree - (before - s.after), try tt.freePages());
+    try std.testing.expectEqual(@as(u64, s.after) * page_size, try tt.fileLen());
+    try tt.expect(N, keepThird);
 
     // A step larger than the free list frees all of it.
     s = try t.vacuum(.{ .incremental = before });
     try std.testing.expectEqual(before - nfree, s.after);
-    try std.testing.expectEqual(0, try vt.freePages());
-    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(0, try tt.freePages());
+    try tt.expect(N, keepThird);
 }
 
 test "BPTree vacuum crash after the moves" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     try t.sync();
     const before = t.npages;
-    const nfree = try vt.freePages();
+    const nfree = try tt.freePages();
     const root = t.root;
 
     // The crash comes after all the moves, before `shrink`. The pool loses the moved pages.
-    const free = try VacTest.gpa.alloc(bool, before);
-    defer VacTest.gpa.free(free);
-    const list = try VacTest.gpa.alloc(u32, before);
-    defer VacTest.gpa.free(list);
+    const free = try TestTree.gpa.alloc(bool, before);
+    defer TestTree.gpa.free(free);
+    const list = try TestTree.gpa.alloc(u32, before);
+    defer TestTree.gpa.free(list);
     _ = try t.markFree(free, list);
     try std.testing.expect(try t.moveTail(free, before) > 0);
     const new_root = t.root;
     try std.testing.expect(new_root != root);
-    try vt.crash();
+    try tt.crash();
 
     // Recovery does the moves again from the log. The file is as long as before, and the old pages are free.
     try std.testing.expectEqual(new_root, t.root);
     try std.testing.expectEqual(before, t.npages);
-    try std.testing.expectEqual(nfree, try vt.freePages());
-    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(nfree, try tt.freePages());
+    try tt.expect(N, keepThird);
     // A vacuum after the crash does the work again.
     try std.testing.expectEqual(before - nfree, (try t.vacuum(.full)).after);
-    try vt.expect(N, keepThird);
+    try tt.expect(N, keepThird);
 }
 
 test "BPTree vacuum crash after the new free list is in the file" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     try t.put("a", "1");
-    for ("wxyz", 0..) |c, i| try t.put(&.{c}, testValue(vt.vbuf, 4 * ovfl_cap, @intCast(i)));
+    for ("wxyz", 0..) |c, i| try t.put(&.{c}, testValue(tt.vbuf, 4 * ovfl_cap, @intCast(i)));
     // The free list: the pages of "w", then "x", then "z". "z" is at the end of the file.
     _ = try t.delete("z");
     _ = try t.delete("x");
@@ -4074,10 +3887,10 @@ test "BPTree vacuum crash after the new free list is in the file" {
     const npages = t.npages;
 
     // The pages of "z" come off the list, so the last page of "x" on the list gets a link of 0.
-    const free = try VacTest.gpa.alloc(bool, npages);
-    defer VacTest.gpa.free(free);
-    const list = try VacTest.gpa.alloc(u32, npages);
-    defer VacTest.gpa.free(list);
+    const free = try TestTree.gpa.alloc(bool, npages);
+    defer TestTree.gpa.free(free);
+    const list = try TestTree.gpa.alloc(u32, npages);
+    defer TestTree.gpa.free(list);
     const nfree = try t.markFree(free, list);
     try std.testing.expectEqual(12, nfree);
     t.durable = false;
@@ -4094,62 +3907,62 @@ test "BPTree vacuum crash after the new free list is in the file" {
     }
 
     // The new link reaches the file, and the crash comes before the meta page.
-    try t.pool.wal.flushTo(VacTest.io, t.pool.wal.end.raw);
+    try t.pool.wal.flushTo(TestTree.io, t.pool.wal.end.raw);
     try t.pool.flush();
-    try vt.crash();
+    try tt.crash();
 
     // The meta page still points to the old list, which now ends before the pages of "z".
     // Recovery sees the log record and builds the free list again.
     try std.testing.expectEqual(npages, t.npages);
-    try std.testing.expectEqual(12, try vt.freePages());
+    try std.testing.expectEqual(12, try tt.freePages());
     try t.check();
-    try std.testing.expectEqualSlices(u8, testValue(vt.vbuf, 4 * ovfl_cap, 2), (try t.get("y", vt.out)).?);
+    try std.testing.expectEqualSlices(u8, testValue(tt.vbuf, 4 * ovfl_cap, 2), (try t.get("y", tt.out)).?);
 }
 
 test "BPTree vacuum crash before the file is cut" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     const before = t.npages;
 
     // The crash comes after the meta page with the new npages, before the file is cut.
-    const free = try VacTest.gpa.alloc(bool, before);
-    defer VacTest.gpa.free(free);
-    const list = try VacTest.gpa.alloc(u32, before);
-    defer VacTest.gpa.free(list);
+    const free = try TestTree.gpa.alloc(bool, before);
+    defer TestTree.gpa.free(free);
+    const list = try TestTree.gpa.alloc(u32, before);
+    defer TestTree.gpa.free(list);
     const nfree = try t.markFree(free, list);
     _ = try t.moveTail(free, before);
     try t.shrink(free, list[0..nfree]);
     const after = t.npages;
     try std.testing.expect(after < before);
-    try vt.crash();
+    try tt.crash();
 
     // The tree uses only the first `after` pages. The rest of the file stays until the next vacuum.
     try std.testing.expectEqual(after, t.npages);
-    try std.testing.expect(try vt.fileLen() > @as(u64, after) * page_size);
-    try vt.expect(N, keepThird);
+    try std.testing.expect(try tt.fileLen() > @as(u64, after) * page_size);
+    try tt.expect(N, keepThird);
     try std.testing.expectEqual(BPTree.VacuumStats{ .before = after, .after = after, .moved = 0 }, try t.vacuum(.truncate));
-    try std.testing.expectEqual(@as(u64, after) * page_size, try vt.fileLen());
-    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(@as(u64, after) * page_size, try tt.fileLen());
+    try tt.expect(N, keepThird);
 }
 
 test "BPTree vacuum pages wait for their log records" {
     if (build_options.pool_paranoid) return error.SkipZigTest;
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     try t.sync();
     t.durable = false;
 
     // The pages of a move carry the LSN of its commit, so an eviction makes the commit durable first.
-    const owners = try VacTest.gpa.alloc(BPTree.Owner, t.npages);
-    defer VacTest.gpa.free(owners);
+    const owners = try TestTree.gpa.alloc(BPTree.Owner, t.npages);
+    defer TestTree.gpa.free(owners);
     @memset(owners, .{});
     var last_leaf: u32 = 0;
     try t.markOwners(owners, t.root, .{ .kind = .root }, &last_leaf, 0);
@@ -4162,16 +3975,16 @@ test "BPTree vacuum pages wait for their log records" {
     try std.testing.expect(t.pool.wal.end.raw > t.pool.wal.durable.raw);
     for ([_]u32{ to, o.from }) |pg| try std.testing.expectEqual(t.pool.wal.end.raw, t.pool.frames[t.pool.find(pg).?].lsn.raw);
     // Page `to` is still on the free list, so only recovery can make the tree whole again.
-    try vt.crash();
-    try vt.expect(N, keepThird);
+    try tt.crash();
+    try tt.expect(N, keepThird);
 }
 
 test "BPTree vacuum and sync wait for the operations that run" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
-    try vt.fill(300, keepThird);
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
+    try tt.fill(300, keepThird);
     const before = t.npages;
 
     const V = struct {
@@ -4187,18 +4000,18 @@ test "BPTree vacuum and sync wait for the operations that run" {
     inline for (.{ V.vacuum, V.sync }) |f| {
         // Hold the gate as an operation does. The other thread must wait until the operation ends.
         const n = t.npages;
-        t.gate.lockSharedUncancelable(VacTest.io);
+        t.gate.lockSharedUncancelable(TestTree.io);
         var done: std.atomic.Value(bool) = .init(false);
         const th = try std.Thread.spawn(.{}, f, .{ t, &done });
-        try VacTest.io.sleep(.fromMilliseconds(50), .awake);
+        try TestTree.io.sleep(.fromMilliseconds(50), .awake);
         try std.testing.expect(!done.load(.acquire));
         try std.testing.expectEqual(n, @atomicLoad(u32, &t.npages, .monotonic));
-        t.gate.unlockShared(VacTest.io);
+        t.gate.unlockShared(TestTree.io);
         th.join();
         try std.testing.expect(done.load(.acquire));
     }
     try std.testing.expect(t.npages < before);
-    try vt.expect(300, keepThird);
+    try tt.expect(300, keepThird);
 }
 
 /// Puts, deletes, gets and scans the keys `first..first + n`, and checks each result. It is one thread of the next test.
@@ -4219,11 +4032,11 @@ const VacWriter = struct {
     }
 
     fn loop(w: *VacWriter) !void {
-        const vbuf = try VacTest.gpa.alloc(u8, 4 * ovfl_cap);
-        defer VacTest.gpa.free(vbuf);
-        const out = try VacTest.gpa.alloc(u8, 4 * ovfl_cap);
-        defer VacTest.gpa.free(out);
-        var kbuf: [VacTest.key_len]u8 = undefined;
+        const vbuf = try TestTree.gpa.alloc(u8, 4 * ovfl_cap);
+        defer TestTree.gpa.free(vbuf);
+        const out = try TestTree.gpa.alloc(u8, 4 * ovfl_cap);
+        defer TestTree.gpa.free(out);
+        var kbuf: [TestTree.key_len]u8 = undefined;
         var prng: std.Random.DefaultPrng = .init(w.first);
         const rand = prng.random();
         for (0..2000) |_| {
@@ -4238,9 +4051,9 @@ const VacWriter = struct {
         }
     }
 
-    fn step(w: *VacWriter, what: usize, j: usize, kbuf: *[VacTest.key_len]u8, vbuf: []u8, out: []u8) !void {
+    fn step(w: *VacWriter, what: usize, j: usize, kbuf: *[TestTree.key_len]u8, vbuf: []u8, out: []u8) !void {
         const i = w.first + j;
-        const key = VacTest.key(kbuf, i);
+        const key = TestTree.key(kbuf, i);
         const val = testValue(vbuf, vacLen(i), @truncate(i));
         switch (what) {
             0 => {
@@ -4259,10 +4072,10 @@ const VacWriter = struct {
             },
             else => {
                 // Only this thread writes these keys, so the scan must give exactly the keys that are present.
-                var lo: [VacTest.key_len]u8 = undefined;
-                var hi: [VacTest.key_len]u8 = undefined;
+                var lo: [TestTree.key_len]u8 = undefined;
+                var hi: [TestTree.key_len]u8 = undefined;
                 var c: ScanCount = .{ .vbuf = vbuf };
-                const n = try w.t.scan(VacTest.key(&lo, w.first), VacTest.key(&hi, w.first + w.n), &c, ScanCount.visit);
+                const n = try w.t.scan(TestTree.key(&lo, w.first), TestTree.key(&hi, w.first + w.n), &c, ScanCount.visit);
                 try std.testing.expectEqual(std.mem.count(bool, w.present, &.{true}), n);
                 if (c.bad) return error.TestUnexpectedResult;
             },
@@ -4281,28 +4094,28 @@ const VacWriter = struct {
 };
 
 test "BPTree online vacuum stops at its goal" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
     const before = t.npages;
 
     // The step is larger than the goal, so one step of 7 pages does it, and it moves at most 7 pages.
     const s = try t.vacuumOnline(.{ .incremental = 7 }, 64, 100);
     try std.testing.expect(s.after <= before - 7);
     try std.testing.expect(s.moved <= 7);
-    try vt.expect(N, keepThird);
+    try tt.expect(N, keepThird);
 }
 
 test "BPTree vacuum while other threads use the tree" {
-    var vt: VacTest = undefined;
-    try vt.init();
-    defer vt.deinit();
-    const t = &vt.t;
+    var tt: TestTree = undefined;
+    try tt.init();
+    defer tt.deinit();
+    const t = &tt.t;
     const N = 600;
-    try vt.fill(N, keepThird);
+    try tt.fill(N, keepThird);
 
     // Three threads write keys after N, and the main thread vacuums in steps until they end.
     var ws: [3]VacWriter = undefined;
@@ -4324,15 +4137,15 @@ test "BPTree vacuum while other threads use the tree" {
     for (&ws) |*w| if (w.err) |err| return err;
     try std.testing.expect(steps > 1);
 
-    try vt.expect(N, keepThird);
-    var kbuf: [VacTest.key_len]u8 = undefined;
+    try tt.expect(N, keepThird);
+    var kbuf: [TestTree.key_len]u8 = undefined;
     for (&ws) |*w| for (w.present, 0..) |p, j| {
-        const got = try t.get(VacTest.key(&kbuf, w.first + j), vt.out);
+        const got = try t.get(TestTree.key(&kbuf, w.first + j), tt.out);
         try std.testing.expectEqual(p, got != null);
     };
     _ = try t.vacuum(.full);
     try std.testing.expectEqual(0, t.freelist);
     try t.check();
-    try vt.crash();
-    try vt.expect(N, keepThird);
+    try tt.crash();
+    try tt.expect(N, keepThird);
 }
