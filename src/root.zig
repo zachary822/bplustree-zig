@@ -659,6 +659,7 @@ pub const BPTree = struct {
 
     root_latch: Io.RwLock = .init,
     alloc_mu: Io.Mutex = .init,
+    gate: Io.RwLock = .init,
     durable: bool = true,
 
     /// Opens the tree in `file`, which must be open for read and write. If the file is empty, it makes an empty tree.
@@ -694,8 +695,14 @@ pub const BPTree = struct {
         self.pool.deinit(gpa);
     }
 
-    /// Writes all changed pages and the meta page, and then syncs the file.
     pub fn sync(self: *BPTree) !void {
+        self.gate.lockUncancelable(self.pool.io);
+        defer self.gate.unlock(self.pool.io);
+        try self.syncLocked();
+    }
+
+    /// Writes all changed pages and the meta page, and then syncs the file.
+    fn syncLocked(self: *BPTree) !void {
         const io = self.pool.io;
         // The log must be durable before a page reaches the file, as in `writeBack`.
         try self.pool.wal.flushTo(io, self.pool.wal.end.load(.acquire));
@@ -824,6 +831,8 @@ pub const BPTree = struct {
     };
 
     pub fn vacuum(self: *BPTree, mode: VacuumMode) !VacuumStats {
+        self.gate.lockUncancelable(self.pool.io);
+        defer self.gate.unlock(self.pool.io);
         const before = self.npages;
         const free = try self.gpa.alloc(bool, before);
         defer self.gpa.free(free);
@@ -832,12 +841,35 @@ pub const BPTree = struct {
         const nfree = try self.markFree(free, list);
         const moved: u32 = switch (mode) {
             .truncate => 0,
-            .full => try self.moveTail(free, before),
-            .incremental => |n| try self.moveTail(free, n),
+            .full => self.moveTail(free, before),
+            .incremental => |n| self.moveTail(free, n),
+        } catch |err| {
+            self.shrink(free, list[0..nfree]) catch {};
+            return err;
         };
         try self.shrink(free, list[0..nfree]);
         try self.truncateFile();
         return .{ .before = before, .after = self.npages, .moved = moved };
+    }
+
+    pub fn vacuumOnline(self: *BPTree, mode: VacuumMode, step: u32, busy_pct: u32) !VacuumStats {
+        std.debug.assert(step > 0 and busy_pct > 0 and busy_pct <= 100);
+        const io = self.pool.io;
+        if (mode == .truncate) return self.vacuum(.truncate);
+        const goal: u32 = if (mode == .incremental) mode.incremental else std.math.maxInt(u32);
+        var total: VacuumStats = .{ .before = @atomicLoad(u32, &self.npages, .monotonic), .after = 0, .moved = 0 };
+        var cut: u32 = 0;
+        while (cut < goal) {
+            const start = Io.Clock.Timestamp.now(io, .awake);
+            const s = try self.vacuum(.{ .incremental = @min(step, goal - cut) });
+            total.moved += s.moved;
+            total.after = s.after;
+            const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+            try io.sleep(.fromNanoseconds(@max(std.time.ns_per_ms, ns * (100 - busy_pct) / busy_pct)), .awake);
+            if (s.after == s.before) break;
+            cut += s.before - s.after;
+        }
+        return total;
     }
 
     fn markFree(self: *BPTree, free: []bool, list: []u32) !usize {
@@ -862,7 +894,7 @@ pub const BPTree = struct {
         if (end == free.len) return;
         try self.relinkFree(free, list, end);
         @atomicStore(u32, &self.npages, end, .monotonic);
-        try self.sync();
+        try self.syncLocked();
     }
 
     fn relinkFree(self: *BPTree, free: []const bool, list: []const u32, end: u32) !void {
@@ -1232,6 +1264,8 @@ pub const BPTree = struct {
 
     pub fn get(self: *BPTree, key: []const u8, out: []u8) !?[]u8 {
         if (key.len > max_key) return error.KeyTooLarge;
+        self.gate.lockSharedUncancelable(self.pool.io);
+        defer self.gate.unlockShared(self.pool.io);
         var op: Op = .{};
         const path = try self.descend(&op, key, .read);
         defer self.releaseHeld(&op);
@@ -1419,6 +1453,8 @@ pub const BPTree = struct {
     pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
+        self.gate.lockSharedUncancelable(self.pool.io);
+        defer self.gate.unlockShared(self.pool.io);
         const local = localSize(val.len);
         const first = if (local < val.len) try self.writeChain(val[local..]) else 0;
         var c: [max_leaf_cell]u8 = undefined;
@@ -1533,6 +1569,8 @@ pub const BPTree = struct {
 
     pub fn delete(self: *BPTree, key: []const u8) !bool {
         if (key.len > max_key) return error.KeyTooLarge;
+        self.gate.lockSharedUncancelable(self.pool.io);
+        defer self.gate.unlockShared(self.pool.io);
         var op: Op = .{};
         const found = try self.deleteIn(&op, key, .optimistic) orelse (try self.deleteIn(&op, key, .write)).?;
         if (op.old_chain != 0) try self.freeChain(op.old_chain, op.lsn);
@@ -1540,8 +1578,8 @@ pub const BPTree = struct {
         return found;
     }
 
-    /// Calls `visit` for each key in `lo..hi`. `lo` is inclusive and `hi` is exclusive. A null bound has no limit.
-    /// The key and value slices are valid only during the call to `visit`.
+    /// The key and value slices are valid only during the call to `visit`. `visit` must not call the tree:
+    /// the scan holds the gate, and a second hold of it waits for a `vacuum` that waits for the scan.
     pub fn scan(
         self: *BPTree,
         lo: ?[]const u8,
@@ -1549,6 +1587,8 @@ pub const BPTree = struct {
         ctx: anytype,
         comptime visit: fn (ctx: @TypeOf(ctx), key: []const u8, val: []const u8) anyerror!void,
     ) !usize {
+        self.gate.lockSharedUncancelable(self.pool.io);
+        defer self.gate.unlockShared(self.pool.io);
         var start_buf: [max_key]u8 = undefined;
         var start: []const u8 = lo orelse "";
         var after: bool = false;
@@ -3576,6 +3616,177 @@ test "BPTree vacuum pages wait for their log records" {
     try std.testing.expect(t.pool.wal.end.raw > t.pool.wal.durable.raw);
     for ([_]u32{ to, o.from }) |pg| try std.testing.expectEqual(t.pool.wal.end.raw, t.pool.frames[t.pool.find(pg).?].lsn.raw);
     // Page `to` is still on the free list, so only recovery can make the tree whole again.
+    try vt.crash();
+    try vt.expect(N, keepThird);
+}
+
+test "BPTree vacuum and sync wait for the operations that run" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    try vt.fill(300, keepThird);
+    const before = t.npages;
+
+    const V = struct {
+        fn vacuum(tree: *BPTree, d: *std.atomic.Value(bool)) void {
+            _ = tree.vacuum(.full) catch |err| std.debug.panic("vacuum: {t}", .{err});
+            d.store(true, .release);
+        }
+        fn sync(tree: *BPTree, d: *std.atomic.Value(bool)) void {
+            tree.sync() catch |err| std.debug.panic("sync: {t}", .{err});
+            d.store(true, .release);
+        }
+    };
+    inline for (.{ V.vacuum, V.sync }) |f| {
+        // Hold the gate as an operation does. The other thread must wait until the operation ends.
+        const n = t.npages;
+        t.gate.lockSharedUncancelable(VacTest.io);
+        var done: std.atomic.Value(bool) = .init(false);
+        const th = try std.Thread.spawn(.{}, f, .{ t, &done });
+        try VacTest.io.sleep(.fromMilliseconds(50), .awake);
+        try std.testing.expect(!done.load(.acquire));
+        try std.testing.expectEqual(n, @atomicLoad(u32, &t.npages, .monotonic));
+        t.gate.unlockShared(VacTest.io);
+        th.join();
+        try std.testing.expect(done.load(.acquire));
+    }
+    try std.testing.expect(t.npages < before);
+    try vt.expect(300, keepThird);
+}
+
+/// Puts, deletes, gets and scans the keys `first..first + n`, and checks each result. It is one thread of the next test.
+const VacWriter = struct {
+    t: *BPTree,
+    first: usize,
+    n: usize,
+    /// Which of the keys are in the tree.
+    present: []bool,
+    done: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+
+    fn go(w: *VacWriter) void {
+        w.loop() catch |err| {
+            w.err = err;
+        };
+        w.done.store(true, .release);
+    }
+
+    fn loop(w: *VacWriter) !void {
+        const vbuf = try VacTest.gpa.alloc(u8, 4 * ovfl_cap);
+        defer VacTest.gpa.free(vbuf);
+        const out = try VacTest.gpa.alloc(u8, 4 * ovfl_cap);
+        defer VacTest.gpa.free(out);
+        var kbuf: [VacTest.key_len]u8 = undefined;
+        var prng: std.Random.DefaultPrng = .init(w.first);
+        const rand = prng.random();
+        for (0..2000) |_| {
+            const j = rand.uintLessThan(usize, w.n);
+            const what = rand.uintLessThan(usize, 4);
+            // An operation that finds the pool full changes nothing, so it can run again.
+            while (true) break w.step(what, j, &kbuf, vbuf, out) catch |err| {
+                if (err != error.PoolExhausted) return err;
+                std.Thread.yield() catch {};
+                continue;
+            };
+        }
+    }
+
+    fn step(w: *VacWriter, what: usize, j: usize, kbuf: *[VacTest.key_len]u8, vbuf: []u8, out: []u8) !void {
+        const i = w.first + j;
+        const key = VacTest.key(kbuf, i);
+        const val = testValue(vbuf, vacLen(i), @truncate(i));
+        switch (what) {
+            0 => {
+                try w.t.put(key, val);
+                w.present[j] = true;
+            },
+            1 => {
+                try std.testing.expectEqual(w.present[j], try w.t.delete(key));
+                w.present[j] = false;
+            },
+            2 => {
+                const got = try w.t.get(key, out);
+                if (w.present[j]) {
+                    try std.testing.expectEqualSlices(u8, val, got.?);
+                } else try std.testing.expectEqual(null, got);
+            },
+            else => {
+                // Only this thread writes these keys, so the scan must give exactly the keys that are present.
+                var lo: [VacTest.key_len]u8 = undefined;
+                var hi: [VacTest.key_len]u8 = undefined;
+                var c: ScanCount = .{ .vbuf = vbuf };
+                const n = try w.t.scan(VacTest.key(&lo, w.first), VacTest.key(&hi, w.first + w.n), &c, ScanCount.visit);
+                try std.testing.expectEqual(std.mem.count(bool, w.present, &.{true}), n);
+                if (c.bad) return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    const ScanCount = struct {
+        vbuf: []u8,
+        bad: bool = false,
+
+        fn visit(c: *ScanCount, k: []const u8, v: []const u8) anyerror!void {
+            const i = std.fmt.parseInt(usize, k[0..8], 10) catch return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, testValue(c.vbuf, vacLen(i), @truncate(i)), v)) c.bad = true;
+        }
+    };
+};
+
+test "BPTree online vacuum stops at its goal" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    const before = t.npages;
+
+    // The step is larger than the goal, so one step of 7 pages does it, and it moves at most 7 pages.
+    const s = try t.vacuumOnline(.{ .incremental = 7 }, 64, 100);
+    try std.testing.expect(s.after <= before - 7);
+    try std.testing.expect(s.moved <= 7);
+    try vt.expect(N, keepThird);
+}
+
+test "BPTree vacuum while other threads use the tree" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+
+    // Three threads write keys after N, and the main thread vacuums in steps until they end.
+    var ws: [3]VacWriter = undefined;
+    var present: [3][100]bool = @splat(@splat(false));
+    var ths: [3]std.Thread = undefined;
+    for (&ws, &present, &ths, 0..) |*w, *pr, *th, i| {
+        w.* = .{ .t = t, .first = N + i * 100, .n = 100, .present = pr };
+        th.* = try std.Thread.spawn(.{}, VacWriter.go, .{w});
+    }
+    var steps: usize = 0;
+    var running = true;
+    while (running) {
+        _ = t.vacuumOnline(.full, 8, 50) catch |err| if (err != error.PoolExhausted) return err;
+        steps += 1;
+        running = false;
+        for (&ws) |*w| running = running or !w.done.load(.acquire);
+    }
+    for (&ths) |th| th.join();
+    for (&ws) |*w| if (w.err) |err| return err;
+    try std.testing.expect(steps > 1);
+
+    try vt.expect(N, keepThird);
+    var kbuf: [VacTest.key_len]u8 = undefined;
+    for (&ws) |*w| for (w.present, 0..) |p, j| {
+        const got = try t.get(VacTest.key(&kbuf, w.first + j), vt.out);
+        try std.testing.expectEqual(p, got != null);
+    };
+    _ = try t.vacuum(.full);
+    try std.testing.expectEqual(0, t.freelist);
+    try t.check(VacTest.gpa);
     try vt.crash();
     try vt.expect(N, keepThird);
 }

@@ -5,6 +5,8 @@
 //!   stress scanmix [scan percent] [update percent] [ops] [nosync]
 //!   stress shrink [keep percent] [truncate | full | pages]
 //!   stress vaccrash <file> <seed> <ms>
+//!   stress online [threads] [step] [busy percent] [read percent]
+//!   stress onlinecrash <file> <seed> <ms>
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -74,6 +76,10 @@ const Shared = struct {
     vers: []u32 = &.{},
     /// Operations that failed with error.PoolExhausted and ran again.
     retries: std.atomic.Value(u64) = .init(0),
+    /// `onlineWorker` stops when this is true.
+    stop: std.atomic.Value(bool) = .init(false),
+    /// The latencies of `onlineWorker`, one for each thread.
+    lats: []Lat = &.{},
 
     /// An operation that fails with error.PoolExhausted changes nothing, so it can run again.
     fn again(sh: *Shared, err: anyerror) !void {
@@ -206,6 +212,138 @@ fn benchWorker(sh: *Shared, id: usize, seed: u64) !void {
     }
 }
 
+/// The latencies of operations. Bucket `i` counts the operations that took less than 2^i microseconds.
+const Lat = struct {
+    buckets: [32]u64 = @splat(0),
+    n: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn add(l: *Lat, ns: u64) void {
+        l.n += 1;
+        l.max_ns = @max(l.max_ns, ns);
+        l.buckets[@min(31, std.math.log2_int_ceil(u64, ns / std.time.ns_per_us + 1))] += 1;
+    }
+
+    fn merge(l: *Lat, o: Lat) void {
+        for (&l.buckets, o.buckets) |*b, x| b.* += x;
+        l.n += o.n;
+        l.max_ns = @max(l.max_ns, o.max_ns);
+    }
+
+    /// An upper bound, in microseconds, of the latency that a fraction `q` of the operations do not pass.
+    fn quantile(l: *const Lat, q: f64) u64 {
+        const want: u64 = @intFromFloat(@ceil(q * @as(f64, @floatFromInt(l.n))));
+        var seen: u64 = 0;
+        for (l.buckets, 0..) |b, i| {
+            seen += b;
+            if (seen >= want) return @as(u64, 1) << @intCast(i);
+        }
+        return std.math.maxInt(u64);
+    }
+};
+
+/// Gets and puts any key until `sh.stop` is true, and records the latency of each operation.
+/// A put gives the key a new version of its value, so a value with a chain frees the old chain.
+fn onlineWorker(sh: *Shared, id: usize, seed: u64) !void {
+    const t = sh.t;
+    const io = t.pool.io;
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const rand = prng.random();
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    var out: [max_test_val]u8 = undefined;
+    const lat = &sh.lats[id];
+
+    while (!sh.stop.load(.acquire)) {
+        const k = rand.uintLessThan(usize, bench_keys);
+        const key = keyOf(&kbuf, k);
+        const start = Io.Clock.Timestamp.now(io, .awake);
+        if (rand.uintLessThan(usize, 100) < sh.read_pct) {
+            _ = while (true) break t.get(key, &out) catch |err| {
+                try sh.again(err);
+                continue;
+            };
+        } else {
+            while (true) break t.put(key, makeVal(&vbuf, k, rand.int(u32) | 1)) catch |err| {
+                try sh.again(err);
+                continue;
+            };
+        }
+        lat.add(@intCast(start.untilNow(io).raw.toNanoseconds()));
+    }
+}
+
+/// Starts a thread that runs `worker` in the threads of `sh`. The thread ends when the workers see `sh.stop`.
+fn runInBackground(comptime worker: anytype, sh: *Shared, seed: u64) !std.Thread {
+    sh.stop.store(false, .release);
+    return std.Thread.spawn(.{}, struct {
+        fn go(s: *Shared, sd: u64) void {
+            run(worker, s, sd) catch |err| std.debug.panic("stress: {t}", .{err});
+        }
+    }.go, .{ sh, seed });
+}
+
+fn printLat(what: []const u8, sh: *const Shared, ns: u64) void {
+    var all: Lat = .{};
+    for (sh.lats) |l| all.merge(l);
+    std.debug.print("{s}: ops={d} ops_per_s={d} p50_us<{d} p99_us<{d} p999_us<{d} max_ms={d}\n", .{
+        what, all.n, all.n * std.time.ns_per_s / ns, all.quantile(0.5), all.quantile(0.99), all.quantile(0.999), all.max_ns / std.time.ns_per_ms,
+    });
+}
+
+/// Loads `bench_keys` keys and deletes 3 of 4, as `shrink` does. Then `threads` threads get and put keys:
+/// first for 5 seconds without a vacuum, then while the main thread vacuums in steps of `step` pages,
+/// with a rest after each step so that the steps take at most `busy_pct` percent of the time.
+/// It prints the latencies of the operations in both parts, and how long each step held them out.
+fn online(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, step: u32, busy_pct: u32) !void {
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    t.durable = false;
+    for (0..bench_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
+    var prng: std.Random.DefaultPrng = .init(11);
+    const rand = prng.random();
+    for (0..bench_keys) |k| {
+        if (rand.uintLessThan(usize, 100) >= 25) _ = try t.delete(keyOf(&kbuf, k));
+    }
+    try t.sync();
+    t.durable = true;
+    sh.lats = try gpa.alloc(Lat, sh.threads);
+    defer gpa.free(sh.lats);
+
+    @memset(sh.lats, .{});
+    var start = Io.Clock.Timestamp.now(io, .awake);
+    var th = try runInBackground(onlineWorker, sh, 5);
+    try io.sleep(.fromSeconds(5), .awake);
+    sh.stop.store(true, .release);
+    th.join();
+    printLat("no vacuum", sh, @intCast(start.untilNow(io).raw.toNanoseconds()));
+
+    // The same steps as `vacuumOnline`, but each step is timed here.
+    @memset(sh.lats, .{});
+    var steps: Lat = .{};
+    var moved: u64 = 0;
+    const before = t.npages;
+    start = Io.Clock.Timestamp.now(io, .awake);
+    th = try runInBackground(onlineWorker, sh, 6);
+    while (true) {
+        const s0 = Io.Clock.Timestamp.now(io, .awake);
+        const s = try t.vacuum(.{ .incremental = step });
+        steps.add(@intCast(s0.untilNow(io).raw.toNanoseconds()));
+        moved += s.moved;
+        if (s.after == s.before) break;
+        const sns: u64 = @intCast(s0.untilNow(io).raw.toNanoseconds());
+        try io.sleep(.fromNanoseconds(@max(std.time.ns_per_ms, sns * (100 - busy_pct) / busy_pct)), .awake);
+    }
+    const ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+    sh.stop.store(true, .release);
+    th.join();
+    printLat("vacuum", sh, ns);
+    std.debug.print("step={d} busy={d}% steps={d} step_p50_us<{d} step_max_ms={d} pages={d}->{d} moved={d} time_ms={d}\n", .{
+        step, busy_pct, steps.n, steps.quantile(0.5), steps.max_ns / std.time.ns_per_ms, before, t.npages, moved, ns / std.time.ns_per_ms,
+    });
+    try t.check(gpa);
+}
+
 /// Scans `scan_len` keys in `scan_pct` percent of the operations, and updates any key (a get and then a put)
 /// in `update_pct` percent. The other operations are gets, 9 of 10 to a hot key.
 /// It runs in one thread, so the pool counters show which operation read which pages.
@@ -258,6 +396,26 @@ fn scanmix(t: *bpt.BPTree, io: Io, scan_pct: usize, update_pct: usize, ops: usiz
         scan_pct, update_pct, ops, ns / std.time.ns_per_ms, get_reads, hit, scan_reads, pool.writes.raw - writes, pool.wal.syncs.raw - syncs, pool.hand.raw - moves,
     });
 }
+
+/// Vacuums in steps of 16 pages, busy at most a quarter of the time, until `stop` is true.
+const VacuumLoop = struct {
+    t: *bpt.BPTree,
+    stop: std.atomic.Value(bool) = .init(false),
+    steps: u64 = 0,
+    moved: u64 = 0,
+
+    fn go(v: *VacuumLoop) void {
+        while (!v.stop.load(.acquire)) {
+            const s = v.t.vacuumOnline(.{ .incremental = 16 }, 16, 25) catch |err| {
+                if (err != error.PoolExhausted) std.debug.panic("stress: vacuum: {t}", .{err});
+                std.Thread.yield() catch {};
+                continue;
+            };
+            v.steps += 1;
+            v.moved += s.moved;
+        }
+    }
+};
 
 fn run(comptime worker: anytype, sh: *Shared, seed: u64) !void {
     var threads: [256]std.Thread = undefined;
@@ -407,6 +565,22 @@ fn vacuumCrash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: 
     }
 }
 
+/// Like `crash`, but the main thread also vacuums the tree in steps while the writers run, as a service would.
+/// The process ends after `ms` milliseconds, in the middle of the operations and of a step.
+fn onlineCrash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
+    const f: Files = try .open(io, path, true);
+    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    t.durable = false;
+    for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
+    try t.sync();
+    t.durable = true;
+    for (0..crash_threads) |id| _ = try std.Thread.spawn(.{}, crashWorker, .{ &t, id, seed + id });
+    _ = try std.Thread.spawn(.{}, exitAfter, .{ io, ms });
+    while (true) _ = t.vacuumOnline(.full, 32, 50) catch |err| if (err != error.PoolExhausted) return err;
+}
+
 /// Opens the tree in `path` and checks it: the tree must be whole, and every value must be a whole value of its key.
 fn verify(io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
     const f: Files = try .open(io, path, false);
@@ -438,6 +612,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "verify") and args.len > 2) return verify(io, gpa, args[2]);
     if (std.mem.eql(u8, mode, "vaccrash") and args.len > 4)
         return vacuumCrash(io, gpa, args[2], try arg(args, 3, 1), try arg(args, 4, 100));
+    if (std.mem.eql(u8, mode, "onlinecrash") and args.len > 4)
+        return onlineCrash(io, gpa, args[2], try arg(args, 3, 1), try arg(args, 4, 100));
 
     var rnd: [4]u8 = undefined;
     io.random(&rnd);
@@ -469,7 +645,12 @@ pub fn main(init: std.process.Init) !void {
         var vbuf: [max_test_val]u8 = undefined;
         var out: [max_test_val]u8 = undefined;
         for (0..rounds) |round| {
+            // A thread vacuums in steps while the workers run.
+            var vac: VacuumLoop = .{ .t = &t };
+            const vt = try std.Thread.spawn(.{}, VacuumLoop.go, .{&vac});
             try run(testWorker, &sh, 1 + round * 1000);
+            vac.stop.store(true, .release);
+            vt.join();
             // Every thread has stopped, so the tree must be whole and hold exactly what the writers put.
             try t.check(gpa);
             var present: usize = 0;
@@ -493,7 +674,7 @@ pub fn main(init: std.process.Init) !void {
             if (try t.scan(null, null, &c, ScanCheck.visit) != present) fail("scan after vacuum: wrong key count", .{});
             c.missing(test_keys);
             try t.sync();
-            std.debug.print("round {d}: ok, {d} keys, vacuum {d} -> {d} pages, {d} moved\n", .{ round, present, vs.before, vs.after, vs.moved });
+            std.debug.print("round {d}: ok, {d} keys, {d} vacuum steps moved {d} pages, vacuum {d} -> {d} pages, {d} moved\n", .{ round, present, vac.steps, vac.moved, vs.before, vs.after, vs.moved });
         }
         std.debug.print("stress test passed: {d} threads, {d} ops each, {d} rounds, {d} retries\n", .{ sh.threads, sh.ops, rounds, sh.retries.raw });
     } else if (std.mem.eql(u8, mode, "bench")) {
@@ -524,6 +705,9 @@ pub fn main(init: std.process.Init) !void {
         else
             .full;
         try shrink(&t, io, f.file, try arg(args, 2, 25), vmode);
+    } else if (std.mem.eql(u8, mode, "online")) {
+        var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 5, 90), .ops = 0 };
+        try online(&t, io, gpa, &sh, @intCast(try arg(args, 3, 256)), @intCast(try arg(args, 4, 25)));
     } else if (std.mem.eql(u8, mode, "scanmix")) {
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
@@ -535,7 +719,8 @@ pub fn main(init: std.process.Init) !void {
     } else {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
             " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>" ++
-            " | stress shrink [keep%] [truncate|full|pages] | stress vaccrash <file> <seed> <ms>\n", .{});
+            " | stress shrink [keep%] [truncate|full|pages] | stress vaccrash <file> <seed> <ms>" ++
+            " | stress online [threads] [step] [busy%] [read%] | stress onlinecrash <file> <seed> <ms>\n", .{});
         return error.BadArgs;
     }
 }
