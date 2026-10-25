@@ -813,6 +813,8 @@ pub const BPTree = struct {
 
     pub const VacuumMode = union(enum) {
         truncate,
+        full,
+        incremental: u32,
     };
 
     pub const VacuumStats = struct {
@@ -830,6 +832,8 @@ pub const BPTree = struct {
         const nfree = try self.markFree(free, list);
         const moved: u32 = switch (mode) {
             .truncate => 0,
+            .full => try self.moveTail(free, before),
+            .incremental => |n| try self.moveTail(free, n),
         };
         try self.shrink(free, list[0..nfree]);
         try self.truncateFile();
@@ -891,6 +895,140 @@ pub const BPTree = struct {
         if (try self.pool.file.length(io) <= len) return;
         try self.pool.file.setLength(io, len);
         try self.pool.file.sync(io);
+    }
+
+    const Owner = struct {
+        kind: Kind = .free,
+        from: u32 = 0,
+        prev: u32 = 0,
+
+        const Kind = enum(u8) {
+            free,
+            root,
+            child,
+            chain_first,
+            chain_next,
+        };
+    };
+
+    fn markOwners(self: *BPTree, owners: []Owner, pgno: u32, owner: Owner, last_leaf: *u32, depth: usize) !void {
+        if (pgno == meta_pgno or pgno >= owners.len or owners[pgno].kind != .free or depth >= max_depth) return error.BadFile;
+        owners[pgno] = owner;
+        const p = try self.getPage(pgno);
+        defer self.pool.unpin(p, .clean);
+        switch (p.kind()) {
+            .leaf => {
+                owners[pgno].prev = last_leaf.*;
+                last_leaf.* = pgno;
+                for (0..p.count()) |i| {
+                    var from = pgno;
+                    var kind: Owner.Kind = .chain_first;
+                    var pg = p.overflow(i);
+                    while (pg != 0) {
+                        if (pg == meta_pgno or pg >= owners.len or owners[pg].kind != .free) return error.BadFile;
+                        owners[pg] = .{ .kind = kind, .from = from };
+                        const q = try self.getPage(pg);
+                        defer self.pool.unpin(q, .clean);
+                        if (q.kind() != .overflow) return error.BadFile;
+                        from = pg;
+                        kind = .chain_next;
+                        pg = q.link();
+                    }
+                }
+            },
+            .internal => for (0..p.count() + 1) |i|
+                try self.markOwners(owners, p.child(i), .{ .kind = .child, .from = pgno }, last_leaf, depth + 1),
+            else => return error.BadFile,
+        }
+    }
+
+    fn moveTail(self: *BPTree, free: []bool, limit: u32) !u32 {
+        const owners = try self.gpa.alloc(Owner, free.len);
+        defer self.gpa.free(owners);
+        @memset(owners, .{});
+        var last_leaf: u32 = 0;
+        try self.markOwners(owners, self.root, .{ .kind = .root }, &last_leaf, 0);
+        var nfree: u32 = 0;
+        for (owners[1..], free[1..]) |o, f| {
+            if (f != (o.kind == .free)) return error.BadFile;
+            if (f) nfree += 1;
+        }
+
+        const fin: u32 = @intCast(free.len - @min(limit, nfree));
+        var hole: u32 = 1;
+        var moved: u32 = 0;
+        var last: u32 = @intCast(free.len);
+        while (last > fin) {
+            last -= 1;
+            if (free[last]) continue;
+            while (!free[hole]) hole += 1;
+            std.debug.assert(hole < fin);
+            try self.movePage(owners, last, hole);
+            free[hole] = false;
+            free[last] = true;
+            moved += 1;
+        }
+        return moved;
+    }
+
+    fn movePage(self: *BPTree, owners: []Owner, from: u32, to: u32) !void {
+        const o = owners[from];
+        const src = try self.getPage(from);
+        defer self.pool.unpin(src, .clean);
+
+        var pages: Stack(Page, 3) = .{};
+        errdefer for (pages.items()) |p| self.pool.unpin(p, .clean);
+        pages.push(try self.pool.pin(to, .no_load));
+        var slot: usize = 0;
+        if (o.kind != .root) {
+            const p = try self.getPage(o.from);
+            pages.push(p);
+            slot = switch (o.kind) {
+                .child => if (p.kind() == .internal) p.childSlot(from) else null,
+                .chain_first => if (p.kind() == .leaf) p.overflowSlot(from) else null,
+                .chain_next => if (p.kind() == .overflow and p.link() == from) @as(usize, 0) else null,
+                else => unreachable,
+            } orelse return error.BadFile;
+        }
+        if (o.prev != 0) {
+            const p = try self.getPage(o.prev);
+            pages.push(p);
+            if (p.kind() != .leaf or p.link() != from) return error.BadFile;
+        }
+
+        const dst = pages.buf[0];
+        @memcpy(dst.page, src.page);
+        switch (o.kind) {
+            .root => self.root = to,
+            .child => pages.buf[1].setChild(slot, to),
+            .chain_first => pages.buf[1].setOverflow(slot, to),
+            .chain_next => pages.buf[1].setLink(to),
+            .free => unreachable,
+        }
+        if (o.prev != 0) pages.buf[pages.len - 1].setLink(to);
+
+        owners[to] = o;
+        owners[from] = .{};
+        switch (dst.kind()) {
+            .internal => for (0..dst.count() + 1) |i| {
+                owners[dst.child(i)].from = to;
+            },
+            .leaf => {
+                for (0..dst.count()) |i| {
+                    const first = dst.overflow(i);
+                    if (first != 0) owners[first].from = to;
+                }
+                if (dst.link() != 0) owners[dst.link()].prev = to;
+            },
+            .overflow => if (dst.link() != 0) {
+                owners[dst.link()].from = to;
+            },
+            else => unreachable,
+        }
+
+        const lsn = self.pool.wal.append(self.pool.io, pages.items(), if (o.kind == .root) to else 0) catch |err|
+            std.debug.panic("vacuum: cannot write the log: {t}", .{err});
+        for (pages.items()) |p| self.pool.unpin(p, .{ .logged = lsn });
     }
 
     /// Pins page `pgno`. A page number that is not in the file means that the file is corrupt.
@@ -1653,8 +1791,26 @@ const Page = struct {
         return get32(c[c.len - 4 ..]);
     }
 
+    fn overflowSlot(self: Page, pgno: u32) ?usize {
+        for (0..self.count()) |i| if (self.overflow(i) == pgno) return i;
+        return null;
+    }
+    fn setOverflow(self: Page, i: usize, pgno: u32) void {
+        std.debug.assert(self.overflow(i) != 0);
+        const end = self.slot(i) + self.cell(i).len;
+        put32(self.page[end - 4 ..], pgno);
+    }
+
     fn child(self: Page, i: usize) u32 {
         return if (i == 0) self.link() else get32(self.cell(i - 1));
+    }
+
+    fn childSlot(self: Page, pgno: u32) ?usize {
+        for (0..self.count() + 1) |i| if (self.child(i) == pgno) return i;
+        return null;
+    }
+    fn setChild(self: Page, i: usize, pgno: u32) void {
+        if (i == 0) self.setLink(pgno) else put32(self.page[self.slot(i - 1)..], pgno);
     }
 
     fn usedBytes(self: Page) usize {
@@ -3115,6 +3271,48 @@ const VacTest = struct {
         }
         return n;
     }
+
+    /// Long keys, so that the tree has more levels and many internal pages. A pool of a few frames
+    /// cannot hold the path of a deep tree, so there the keys are short.
+    const key_len = if (pool_frames >= 16) @min(200, max_key) else 16;
+
+    fn key(buf: *[key_len]u8, i: usize) []const u8 {
+        @memset(buf, 'k');
+        _ = std.fmt.bufPrint(buf, "{d:0>8}", .{i}) catch unreachable;
+        return buf;
+    }
+
+    /// Puts keys `0..n`, and then deletes the keys that `keep` rejects, in a random order.
+    /// Before the keys, a value with a chain of 128 pages takes the start of the file. Its delete at the end
+    /// frees those pages, so that the root and the other pages of the tree are near the end of the file.
+    fn fill(self: *VacTest, n: usize, comptime keep: fn (usize) bool) !void {
+        const front = try gpa.alloc(u8, 128 * ovfl_cap);
+        defer gpa.free(front);
+        try self.t.put("!", testValue(front, front.len, 0));
+        defer _ = self.t.delete("!") catch unreachable;
+        var kbuf: [key_len]u8 = undefined;
+        for (0..n) |i| try self.t.put(key(&kbuf, i), testValue(self.vbuf, vacLen(i), @truncate(i)));
+        const order = try gpa.alloc(usize, n);
+        defer gpa.free(order);
+        for (order, 0..) |*o, i| o.* = i;
+        var prng: std.Random.DefaultPrng = .init(n);
+        prng.random().shuffle(usize, order);
+        for (order) |i| if (!keep(i)) try std.testing.expect(try self.t.delete(key(&kbuf, i)));
+        // Put the values with chains again. The new chains take pages from the free list, in any order.
+        for (order) |i| if (keep(i) and vacLen(i) > max_local) try self.t.put(key(&kbuf, i), testValue(self.vbuf, vacLen(i), @truncate(i)));
+    }
+
+    /// Checks the tree, and that keys `0..n` are in it if `keep` accepts them.
+    fn expect(self: *VacTest, n: usize, comptime keep: fn (usize) bool) !void {
+        try self.t.check(gpa);
+        var kbuf: [key_len]u8 = undefined;
+        for (0..n) |i| {
+            const got = try self.t.get(key(&kbuf, i), self.out);
+            if (keep(i)) {
+                try std.testing.expectEqualSlices(u8, testValue(self.vbuf, vacLen(i), @truncate(i)), got.?);
+            } else try std.testing.expectEqual(null, got);
+        }
+    }
 };
 
 test "BPTree vacuum truncates the free tail" {
@@ -3151,4 +3349,233 @@ test "BPTree vacuum truncates the free tail" {
     try std.testing.expectEqual(small + 8, t.npages);
     try std.testing.expectEqual(0, try vt.freePages());
     try t.check(VacTest.gpa);
+}
+
+/// The value length of key `i` in the vacuum tests: one value in five has a chain of up to three pages.
+fn vacLen(i: usize) usize {
+    return if (i % 5 == 0) max_local + 1 + i * 97 % (3 * ovfl_cap) else 10 + i % 40;
+}
+
+fn keepThird(i: usize) bool {
+    return i % 3 == 0;
+}
+
+fn keepAll(_: usize) bool {
+    return true;
+}
+
+test "BPTree vacuum moves pages to the free pages" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    const before = t.npages;
+    const nfree = try vt.freePages();
+    try std.testing.expect(nfree > before / 2);
+
+    const s = try t.vacuum(.full);
+    try std.testing.expectEqual(before, s.before);
+    try std.testing.expectEqual(before - nfree, s.after);
+    try std.testing.expect(s.moved > 0);
+    // No free page is left, so check shows that each page below npages is in the tree.
+    try std.testing.expectEqual(0, t.freelist);
+    try std.testing.expectEqual(@as(u64, s.after) * page_size, try vt.fileLen());
+    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(BPTree.VacuumStats{ .before = s.after, .after = s.after, .moved = 0 }, try t.vacuum(.full));
+
+    try vt.crash();
+    try std.testing.expectEqual(s.after, t.npages);
+    try vt.expect(N, keepThird);
+    // The tree grows again from the new end of the file.
+    var kbuf: [VacTest.key_len]u8 = undefined;
+    for (0..N) |i| if (!keepThird(i)) try t.put(VacTest.key(&kbuf, i), testValue(vt.vbuf, vacLen(i), @truncate(i)));
+    try vt.expect(N, keepAll);
+}
+
+test "BPTree vacuum moves the root" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    const root = t.root;
+    const s = try t.vacuum(.full);
+    try std.testing.expect(root >= s.after);
+    try std.testing.expect(t.root < s.after);
+    try vt.expect(N, keepThird);
+    try vt.crash();
+    try vt.expect(N, keepThird);
+}
+
+test "BPTree incremental vacuum" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    const before = t.npages;
+    const nfree = try vt.freePages();
+
+    // Each step makes the file at least 7 pages shorter: more if the pages before the cut are free too.
+    // The free pages below the new end stay on the free list.
+    var s = try t.vacuum(.{ .incremental = 7 });
+    try std.testing.expect(s.after <= before - 7);
+    try std.testing.expectEqual(nfree - (before - s.after), try vt.freePages());
+    try vt.expect(N, keepThird);
+    const first = s.after;
+    s = try t.vacuum(.{ .incremental = 7 });
+    try std.testing.expect(s.after <= first - 7);
+    try std.testing.expectEqual(nfree - (before - s.after), try vt.freePages());
+    try std.testing.expectEqual(@as(u64, s.after) * page_size, try vt.fileLen());
+    try vt.expect(N, keepThird);
+
+    // A step larger than the free list frees all of it.
+    s = try t.vacuum(.{ .incremental = before });
+    try std.testing.expectEqual(before - nfree, s.after);
+    try std.testing.expectEqual(0, try vt.freePages());
+    try vt.expect(N, keepThird);
+}
+
+test "BPTree vacuum crash after the moves" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    try t.sync();
+    const before = t.npages;
+    const nfree = try vt.freePages();
+    const root = t.root;
+
+    // The crash comes after all the moves, before `shrink`. The pool loses the moved pages.
+    const free = try VacTest.gpa.alloc(bool, before);
+    defer VacTest.gpa.free(free);
+    const list = try VacTest.gpa.alloc(u32, before);
+    defer VacTest.gpa.free(list);
+    _ = try t.markFree(free, list);
+    try std.testing.expect(try t.moveTail(free, before) > 0);
+    const new_root = t.root;
+    try std.testing.expect(new_root != root);
+    try vt.crash();
+
+    // Recovery does the moves again from the log. The file is as long as before, and the old pages are free.
+    try std.testing.expectEqual(new_root, t.root);
+    try std.testing.expectEqual(before, t.npages);
+    try std.testing.expectEqual(nfree, try vt.freePages());
+    try vt.expect(N, keepThird);
+    // A vacuum after the crash does the work again.
+    try std.testing.expectEqual(before - nfree, (try t.vacuum(.full)).after);
+    try vt.expect(N, keepThird);
+}
+
+test "BPTree vacuum crash after the new free list is in the file" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    try t.put("a", "1");
+    for ("wxyz", 0..) |c, i| try t.put(&.{c}, testValue(vt.vbuf, 4 * ovfl_cap, @intCast(i)));
+    // The free list: the pages of "w", then "x", then "z". "z" is at the end of the file.
+    _ = try t.delete("z");
+    _ = try t.delete("x");
+    _ = try t.delete("w");
+    try t.sync();
+    const npages = t.npages;
+
+    // The pages of "z" come off the list, so the last page of "x" on the list gets a link of 0.
+    const free = try VacTest.gpa.alloc(bool, npages);
+    defer VacTest.gpa.free(free);
+    const list = try VacTest.gpa.alloc(u32, npages);
+    defer VacTest.gpa.free(list);
+    const nfree = try t.markFree(free, list);
+    try std.testing.expectEqual(12, nfree);
+    t.durable = false;
+    try t.relinkFree(free, list[0..nfree], npages - 4);
+    const changed = list[7];
+    const p = try t.getPage(changed);
+    try std.testing.expectEqual(0, p.link());
+    t.pool.unpin(p, .clean);
+    // The changed page waits for the log record, so an eviction of it makes the record durable first.
+    // (A paranoid pool writes a page out at each unpin, so there the record is durable already.)
+    if (!build_options.pool_paranoid) {
+        try std.testing.expect(t.pool.wal.end.raw > t.pool.wal.durable.raw);
+        try std.testing.expectEqual(t.pool.wal.end.raw, t.pool.frames[t.pool.find(changed).?].lsn.raw);
+    }
+
+    // The new link reaches the file, and the crash comes before the meta page.
+    try t.pool.wal.flushTo(VacTest.io, t.pool.wal.end.raw);
+    try t.pool.flush();
+    try vt.crash();
+
+    // The meta page still points to the old list, which now ends before the pages of "z".
+    // Recovery sees the log record and builds the free list again.
+    try std.testing.expectEqual(npages, t.npages);
+    try std.testing.expectEqual(12, try vt.freePages());
+    try t.check(VacTest.gpa);
+    try std.testing.expectEqualSlices(u8, testValue(vt.vbuf, 4 * ovfl_cap, 2), (try t.get("y", vt.out)).?);
+}
+
+test "BPTree vacuum crash before the file is cut" {
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    const before = t.npages;
+
+    // The crash comes after the meta page with the new npages, before the file is cut.
+    const free = try VacTest.gpa.alloc(bool, before);
+    defer VacTest.gpa.free(free);
+    const list = try VacTest.gpa.alloc(u32, before);
+    defer VacTest.gpa.free(list);
+    const nfree = try t.markFree(free, list);
+    _ = try t.moveTail(free, before);
+    try t.shrink(free, list[0..nfree]);
+    const after = t.npages;
+    try std.testing.expect(after < before);
+    try vt.crash();
+
+    // The tree uses only the first `after` pages. The rest of the file stays until the next vacuum.
+    try std.testing.expectEqual(after, t.npages);
+    try std.testing.expect(try vt.fileLen() > @as(u64, after) * page_size);
+    try vt.expect(N, keepThird);
+    try std.testing.expectEqual(BPTree.VacuumStats{ .before = after, .after = after, .moved = 0 }, try t.vacuum(.truncate));
+    try std.testing.expectEqual(@as(u64, after) * page_size, try vt.fileLen());
+    try vt.expect(N, keepThird);
+}
+
+test "BPTree vacuum pages wait for their log records" {
+    if (build_options.pool_paranoid) return error.SkipZigTest;
+    var vt: VacTest = undefined;
+    try vt.init();
+    defer vt.deinit();
+    const t = &vt.t;
+    const N = 600;
+    try vt.fill(N, keepThird);
+    try t.sync();
+    t.durable = false;
+
+    // The pages of a move carry the LSN of its commit, so an eviction makes the commit durable first.
+    const owners = try VacTest.gpa.alloc(BPTree.Owner, t.npages);
+    defer VacTest.gpa.free(owners);
+    @memset(owners, .{});
+    var last_leaf: u32 = 0;
+    try t.markOwners(owners, t.root, .{ .kind = .root }, &last_leaf, 0);
+    var from = t.npages - 1;
+    while (owners[from].kind != .child) from -= 1;
+    const o = owners[from];
+    var to: u32 = 1;
+    while (owners[to].kind != .free) to += 1;
+    try t.movePage(owners, from, to);
+    try std.testing.expect(t.pool.wal.end.raw > t.pool.wal.durable.raw);
+    for ([_]u32{ to, o.from }) |pg| try std.testing.expectEqual(t.pool.wal.end.raw, t.pool.frames[t.pool.find(pg).?].lsn.raw);
+    // Page `to` is still on the free list, so only recovery can make the tree whole again.
+    try vt.crash();
+    try vt.expect(N, keepThird);
 }

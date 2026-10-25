@@ -3,7 +3,8 @@
 //!   stress test [threads] [ops per thread] [rounds]
 //!   stress bench [threads] [read percent] [ops per thread]
 //!   stress scanmix [scan percent] [update percent] [ops] [nosync]
-//!   stress shrink [keep percent]
+//!   stress shrink [keep percent] [truncate | full | pages]
+//!   stress vaccrash <file> <seed> <ms>
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -371,6 +372,41 @@ fn shrink(t: *bpt.BPTree, io: Io, file: Io.File, keep_pct: usize, mode: bpt.BPTr
     });
 }
 
+/// Ends the process after `ms` milliseconds, like a crash.
+fn exitAfter(io: Io, ms: u64) void {
+    io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+    std.process.exit(0);
+}
+
+/// Fills a new tree in `path` and syncs it. Then it changes keys and vacuums the tree in a loop,
+/// until the process ends after `ms` milliseconds, often in the middle of a vacuum.
+fn vacuumCrash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !void {
+    const f: Files = try .open(io, path, true);
+    var t: bpt.BPTree = try .init(gpa, io, f.file, f.log);
+    var kbuf: [16]u8 = undefined;
+    var vbuf: [max_test_val]u8 = undefined;
+    t.durable = false;
+    for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
+    try t.sync();
+    _ = try std.Thread.spawn(.{}, exitAfter, .{ io, ms });
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const rand = prng.random();
+    while (true) {
+        // Deletes free pages all over the file, and puts take some of them again.
+        for (0..500) |_| {
+            const k = rand.uintLessThan(usize, test_keys);
+            if (rand.uintLessThan(usize, 10) < 6) {
+                _ = try t.delete(keyOf(&kbuf, k));
+            } else try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, rand.int(u32) | 1));
+        }
+        _ = try t.vacuum(switch (rand.uintLessThan(usize, 3)) {
+            0 => .truncate,
+            1 => .full,
+            else => .{ .incremental = rand.uintLessThan(u32, 200) },
+        });
+    }
+}
+
 /// Opens the tree in `path` and checks it: the tree must be whole, and every value must be a whole value of its key.
 fn verify(io: Io, gpa: std.mem.Allocator, path: []const u8) !void {
     const f: Files = try .open(io, path, false);
@@ -400,6 +436,8 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, mode, "crash") and args.len > 4)
         return crash(io, gpa, args[2], try arg(args, 3, 1), try arg(args, 4, 100));
     if (std.mem.eql(u8, mode, "verify") and args.len > 2) return verify(io, gpa, args[2]);
+    if (std.mem.eql(u8, mode, "vaccrash") and args.len > 4)
+        return vacuumCrash(io, gpa, args[2], try arg(args, 3, 1), try arg(args, 4, 100));
 
     var rnd: [4]u8 = undefined;
     io.random(&rnd);
@@ -448,8 +486,14 @@ pub fn main(init: std.process.Init) !void {
             const n = try t.scan(null, null, &c, ScanCheck.visit);
             c.missing(test_keys);
             if (n != present) fail("scan of all keys gives {d} keys, but {d} are in the tree", .{ n, present });
+            // Vacuum, and check the tree again. The next round runs on the shorter file.
+            const vs = try t.vacuum(.full);
+            try t.check(gpa);
+            c = .{ .sh = &sh, .id = null, .lo = 0, .hi = test_keys - 1, .next = 0 };
+            if (try t.scan(null, null, &c, ScanCheck.visit) != present) fail("scan after vacuum: wrong key count", .{});
+            c.missing(test_keys);
             try t.sync();
-            std.debug.print("round {d}: ok, {d} keys\n", .{ round, present });
+            std.debug.print("round {d}: ok, {d} keys, vacuum {d} -> {d} pages, {d} moved\n", .{ round, present, vs.before, vs.after, vs.moved });
         }
         std.debug.print("stress test passed: {d} threads, {d} ops each, {d} rounds, {d} retries\n", .{ sh.threads, sh.ops, rounds, sh.retries.raw });
     } else if (std.mem.eql(u8, mode, "bench")) {
@@ -473,7 +517,13 @@ pub fn main(init: std.process.Init) !void {
             total * std.time.ns_per_s / ns, sh.retries.raw, t.pool.wal.syncs.raw - syncs, @as(f64, @floatFromInt(t.pool.locks.raw - locks)) / @as(f64, @floatFromInt(total)),
         });
     } else if (std.mem.eql(u8, mode, "shrink")) {
-        try shrink(&t, io, f.file, try arg(args, 2, 25), .truncate);
+        const vmode: bpt.BPTree.VacuumMode = if (args.len > 3 and std.mem.eql(u8, args[3], "truncate"))
+            .truncate
+        else if (args.len > 3 and !std.mem.eql(u8, args[3], "full"))
+            .{ .incremental = try std.fmt.parseInt(u32, args[3], 10) }
+        else
+            .full;
+        try shrink(&t, io, f.file, try arg(args, 2, 25), vmode);
     } else if (std.mem.eql(u8, mode, "scanmix")) {
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
@@ -485,7 +535,7 @@ pub fn main(init: std.process.Init) !void {
     } else {
         std.debug.print("usage: stress test [threads] [ops] [rounds] | stress bench [threads] [read%] [ops]" ++
             " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>" ++
-            " | stress shrink [keep%]\n", .{});
+            " | stress shrink [keep%] [truncate|full|pages] | stress vaccrash <file> <seed> <ms>\n", .{});
         return error.BadArgs;
     }
 }
