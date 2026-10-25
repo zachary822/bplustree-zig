@@ -46,11 +46,11 @@ fn get32(p: []const u8) u32 {
 }
 
 fn put16(p: []u8, v: u16) void {
-    return std.mem.writeInt(u16, p[0..2], v, .little);
+    std.mem.writeInt(u16, p[0..2], v, .little);
 }
 
 fn put32(p: []u8, v: u32) void {
-    return std.mem.writeInt(u32, p[0..4], v, .little);
+    std.mem.writeInt(u32, p[0..4], v, .little);
 }
 
 /// A stack that keeps at most `cap` items inline.
