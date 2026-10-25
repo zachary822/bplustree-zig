@@ -12,4 +12,4 @@ zig-pkg/
 *~
 
 *.bin
-*.wal
+*.bin.*

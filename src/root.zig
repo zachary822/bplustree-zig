@@ -615,6 +615,29 @@ const Pool = struct {
         }
     }
 
+    fn pinCached(self: *Pool, pgno: u32) !?Page {
+        const part = self.partition(pgno);
+        self.lockPart(part, .shared);
+        const f = part.map.get(pgno) orelse {
+            part.lock.unlockShared(self.io);
+            return null;
+        };
+        pinFound(&self.frames[f], true);
+        part.lock.unlockShared(self.io);
+        return try self.ready(f);
+    }
+
+    fn dirtyPages(self: *Pool, out: []u32) usize {
+        var n: usize = 0;
+        for (&self.frames) |*fr| {
+            const s = fr.load();
+            if (!s.dirty or !s.mapped) continue;
+            out[n] = fr.pgno.?;
+            n += 1;
+        }
+        return n;
+    }
+
     fn pinned(self: *Pool) usize {
         var n: usize = 0;
         for (&self.frames) |*fr| n += fr.load().pins;
@@ -718,6 +741,7 @@ pub const BPTree = struct {
     root_latch: Io.RwLock = .init,
     alloc_mu: Io.Mutex = .init,
     gate: Io.RwLock = .init,
+    ckpt_mu: Io.Mutex = .init,
     durable: bool = true,
     pending: ?Checkpoint = null,
 
@@ -764,9 +788,67 @@ pub const BPTree = struct {
     }
 
     pub fn sync(self: *BPTree) !void {
+        self.ckpt_mu.lockUncancelable(self.pool.io);
+        defer self.ckpt_mu.unlock(self.pool.io);
         self.gate.lockUncancelable(self.pool.io);
         defer self.gate.unlock(self.pool.io);
         try self.syncLocked();
+    }
+
+    pub const CheckpointStats = struct {
+        written: u32,
+        pause_ns: u64,
+    };
+
+    pub fn checkpoint(self: *BPTree) !CheckpointStats {
+        const io = self.pool.io;
+        self.ckpt_mu.lockUncancelable(io);
+        defer self.ckpt_mu.unlock(io);
+        const dirty = try self.gpa.alloc(u32, pool_frames);
+        defer self.gpa.free(dirty);
+
+        const start = Io.Clock.Timestamp.now(io, .awake);
+        self.gate.lockUncancelable(io);
+        const ck: Checkpoint, const n = blk: {
+            defer self.gate.unlock(io);
+            const ck = self.pending orelse ck: {
+                _ = try self.pool.wal.nextRun(io);
+                break :ck self.here();
+            };
+            self.pending = ck;
+            break :blk .{ ck, self.pool.dirtyPages(dirty) };
+        };
+        const pause_ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
+
+        const written = try self.writePages(dirty[0..n]);
+        try self.checkpointEnd(ck);
+        self.pending = null;
+        return .{ .written = written, .pause_ns = pause_ns };
+    }
+
+    fn writePages(self: *BPTree, list: []u32) !u32 {
+        const io = self.pool.io;
+        try self.pool.wal.flushTo(io, self.pool.wal.end.load(.acquire));
+        var written: u32 = 0;
+        var n = list.len;
+        while (n > 0) {
+            var left: usize = 0;
+            for (list[0..n]) |pgno| {
+                const p = (try self.pool.pinCached(pgno)) orelse continue;
+                defer self.pool.unpin(p, .clean);
+                const f = self.pool.frameIndex(p);
+                if (!self.pool.frames[f].load().dirty) continue;
+                if (try self.pool.writeVictim(f)) {
+                    written += 1;
+                } else {
+                    list[left] = pgno;
+                    left += 1;
+                }
+            }
+            n = left;
+            if (n > 0) std.Thread.yield() catch {};
+        }
+        return written;
     }
 
     /// Writes all changed pages and the meta page, and then syncs the file.
@@ -914,6 +996,8 @@ pub const BPTree = struct {
     };
 
     pub fn vacuum(self: *BPTree, mode: VacuumMode) !VacuumStats {
+        self.ckpt_mu.lockUncancelable(self.pool.io);
+        defer self.ckpt_mu.unlock(self.pool.io);
         self.gate.lockUncancelable(self.pool.io);
         defer self.gate.unlock(self.pool.io);
         const before = self.npages;
@@ -2323,6 +2407,184 @@ test "BPTree recovery stops at a torn next record" {
     var t: BPTree = try .init(std.testing.allocator, io, file, log);
     defer t.deinit();
     try testExpect(&t, N, "one");
+}
+
+const CkptTest = struct {
+    t: *BPTree,
+    done: std.atomic.Value(usize) = .init(0),
+
+    const threads = 4;
+    const keys = 600;
+
+    /// Puts its keys, `k % threads == id`, with value "v<round>", `rounds` times.
+    fn writer(c: *CkptTest, id: usize, rounds: usize) void {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [16]u8 = undefined;
+        for (0..rounds) |round| {
+            var k = id;
+            while (k < keys) : (k += threads) {
+                const key = std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{k}) catch unreachable;
+                const val = std.fmt.bufPrint(&vbuf, "v{d}", .{round}) catch unreachable;
+                while (true) break c.t.put(key, val) catch |err| {
+                    if (err != error.PoolExhausted) std.debug.panic("put: {t}", .{err});
+                    std.Thread.yield() catch {};
+                    continue;
+                };
+            }
+        }
+        _ = c.done.fetchAdd(1, .release);
+    }
+
+    /// Runs the writers, and checkpoints until they are done. Returns the number of checkpoints.
+    fn run(c: *CkptTest, rounds: usize) !usize {
+        var ths: [threads]std.Thread = undefined;
+        for (&ths, 0..) |*th, id| th.* = try std.Thread.spawn(.{}, writer, .{ c, id, rounds });
+        var n: usize = 0;
+        while (c.done.load(.acquire) < threads) : (n += 1) _ = try c.t.checkpoint();
+        for (ths) |th| th.join();
+        return n;
+    }
+};
+
+test "BPTree checkpoint while other threads write" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer closeTestLog(log);
+    const rounds = 8;
+    var e: u32 = undefined;
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit();
+        e = t.pool.wal.epoch;
+        var c: CkptTest = .{ .t = &t };
+        try std.testing.expect(try c.run(rounds) > 0);
+        try testExpect(&t, CkptTest.keys, "v7");
+        // After the last checkpoint, the file of the run before is empty.
+        try std.testing.expectEqual(0, try log[(t.pool.wal.epoch + 1) % 2].length(io));
+        // More changes after the last checkpoint, and then a crash.
+        try testPut(&t, CkptTest.keys, "after");
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit();
+    try testExpect(&t, CkptTest.keys, "after");
+    try std.testing.expect(t.pool.wal.epoch > e + 3);
+}
+
+test "BPTree checkpoint waits for the operations that run" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer closeTestLog(log);
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit();
+        try testPut(&t, 10, "one");
+        // Now no page is dirty.
+        try t.sync();
+
+        // Do the work of a put by hand: change the root leaf and log it, but do not unpin it yet.
+        t.gate.lockSharedUncancelable(io);
+        const p = try t.getPage(t.root);
+        const r = p.search("key00000000");
+        try std.testing.expect(r.found);
+        @memcpy(@constCast(p.localVal(r.index)), "two");
+        const lsn = try t.pool.wal.append(io, &.{p}, t.root);
+
+        // The checkpoint must wait until the operation ends. If it does not, it starts its run after the
+        // log record, but it does not see the page as dirty, and it empties the file that holds the record.
+        const C = struct {
+            fn run(tree: *BPTree) void {
+                _ = tree.checkpoint() catch |err| std.debug.panic("checkpoint: {t}", .{err});
+            }
+        };
+        const th = try std.Thread.spawn(.{}, C.run, .{&t});
+        try io.sleep(.fromMilliseconds(50), .awake);
+        t.pool.unpin(p, .{ .logged = lsn });
+        t.gate.unlockShared(io);
+        th.join();
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit();
+    var out: [max_local]u8 = undefined;
+    try std.testing.expectEqualStrings("two", (try t.get("key00000000", &out)).?);
+}
+
+test "BPTree checkpoint keeps the root of its run start" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer closeTestLog(log);
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit();
+        try testPut(&t, 10, "one");
+        const root = t.root;
+
+        // Pin the dirty root leaf, so that the checkpoint waits for it after its run starts.
+        const p = try t.getPage(root);
+        const C = struct {
+            fn run(tree: *BPTree) void {
+                _ = tree.checkpoint() catch |err| std.debug.panic("checkpoint: {t}", .{err});
+            }
+        };
+        const th = try std.Thread.spawn(.{}, C.run, .{&t});
+        try io.sleep(.fromMilliseconds(50), .awake);
+        // Now an operation splits the root: it sets the new root before it logs its pages and commits.
+        // Then the power goes off before the commit.
+        t.root = t.npages;
+        t.pool.unpin(p, .clean);
+        th.join();
+        t.root = root;
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit();
+    try testExpect(&t, 10, "one");
+}
+
+test "BPTree crash right after a checkpoint" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer closeTestLog(log);
+    const N = 4000;
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit();
+        try testPut(&t, N, "one");
+        for (0..N) |i| {
+            var kbuf: [16]u8 = undefined;
+            if (i < N * 3 / 4) _ = try t.delete(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}));
+        }
+        const s = try t.checkpoint();
+        // A paranoid pool writes each page when it is unpinned, so no page is dirty.
+        if (!build_options.pool_paranoid) try std.testing.expect(s.written > 0);
+        // The new run is empty, so recovery has no record to read.
+        try std.testing.expectEqual(t.pool.wal.start.raw, t.pool.wal.end.raw);
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit();
+    try t.check();
+    // The meta page holds the free list of the run start, with the pages that the deletes freed.
+    try std.testing.expect(t.freelist != 0);
+    var kbuf: [16]u8 = undefined;
+    var out: [max_local]u8 = undefined;
+    for (0..N) |i| {
+        const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out);
+        if (i < N * 3 / 4) try std.testing.expectEqual(null, got) else try std.testing.expectEqualStrings("one", got.?);
+    }
 }
 
 test "BPTree recovers values with chains after a crash" {

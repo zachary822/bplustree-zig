@@ -7,7 +7,7 @@
 //!   stress vaccrash <file> <seed> <ms>
 //!   stress online [threads] [step] [busy percent] [read percent]
 //!   stress onlinecrash <file> <seed> <ms>
-//!   stress walgrow [threads] [seconds] [read percent]
+//!   stress walgrow [threads] [seconds] [read percent] [ckpt]
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -346,9 +346,10 @@ fn online(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, step: u32
 }
 
 /// Loads `bench_keys` keys and syncs. Then `threads` threads get and put keys for `secs` seconds, and nothing
-/// calls `sync`. It prints the size of the log after each second. At the end it calls `sync` while the threads
-/// still run, and prints how long the sync took and the latencies of the operations around it.
-fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files, secs: usize) !void {
+/// calls `sync`. It prints the size of the log after each second. With `ckpt`, it then runs a checkpoint and
+/// prints what it did. At the end it calls `sync` while the threads still run, and prints how long the sync took
+/// and the latencies of the operations around it.
+fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files, secs: usize, ckpt: bool) !void {
     var kbuf: [16]u8 = undefined;
     var vbuf: [max_test_val]u8 = undefined;
     t.durable = false;
@@ -360,13 +361,23 @@ fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files
     @memset(sh.lats, .{});
 
     const th = try runInBackground(onlineWorker, sh, 5);
+    var start = Io.Clock.Timestamp.now(io, .awake);
     for (1..secs + 1) |s| {
         try io.sleep(.fromSeconds(1), .awake);
-        std.debug.print("second {d}: log_kb={d}\n", .{ s, try f.logLength(io) / 1024 });
+        const log_kb = try f.logLength(io) / 1024;
+        if (!ckpt) {
+            std.debug.print("second {d}: log_kb={d}\n", .{ s, log_kb });
+            continue;
+        }
+        const c = try t.checkpoint();
+        std.debug.print("second {d}: log_kb={d} checkpoint: written={d} pause_us={d} log_kb_after={d}\n", .{
+            s, log_kb, c.written, c.pause_ns / std.time.ns_per_us, try f.logLength(io) / 1024,
+        });
     }
+    printLat(if (ckpt) "with checkpoints" else "no checkpoint", sh, @intCast(start.untilNow(io).raw.toNanoseconds()));
     // The latencies from here on are of the operations around the sync.
     @memset(sh.lats, .{});
-    const start = Io.Clock.Timestamp.now(io, .awake);
+    start = Io.Clock.Timestamp.now(io, .awake);
     try t.sync();
     const sync_ns: u64 = @intCast(start.untilNow(io).raw.toNanoseconds());
     try io.sleep(.fromMilliseconds(200), .awake);
@@ -447,6 +458,22 @@ const VacuumLoop = struct {
             };
             v.steps += 1;
             v.moved += s.moved;
+        }
+    }
+};
+
+/// Runs checkpoints one after the other until `stop`.
+const CheckpointLoop = struct {
+    t: *bpt.BPTree,
+    stop: std.atomic.Value(bool) = .init(false),
+    n: u64 = 0,
+    written: u64 = 0,
+
+    fn go(c: *CheckpointLoop) void {
+        while (!c.stop.load(.acquire)) {
+            const s = c.t.checkpoint() catch |err| std.debug.panic("stress: checkpoint: {t}", .{err});
+            c.n += 1;
+            c.written += s.written;
         }
     }
 };
@@ -692,9 +719,13 @@ pub fn main(init: std.process.Init) !void {
             // A thread vacuums in steps while the workers run.
             var vac: VacuumLoop = .{ .t = &t };
             const vt = try std.Thread.spawn(.{}, VacuumLoop.go, .{&vac});
+            var ckpt: CheckpointLoop = .{ .t = &t };
+            const ct = try std.Thread.spawn(.{}, CheckpointLoop.go, .{&ckpt});
             try run(testWorker, &sh, 1 + round * 1000);
             vac.stop.store(true, .release);
             vt.join();
+            ckpt.stop.store(true, .release);
+            ct.join();
             // Every thread has stopped, so the tree must be whole and hold exactly what the writers put.
             try t.check();
             var present: usize = 0;
@@ -718,7 +749,9 @@ pub fn main(init: std.process.Init) !void {
             if (try t.scan(null, null, &c, ScanCheck.visit) != present) fail("scan after vacuum: wrong key count", .{});
             c.missing(test_keys);
             try t.sync();
-            std.debug.print("round {d}: ok, {d} keys, {d} vacuum steps moved {d} pages, vacuum {d} -> {d} pages, {d} moved\n", .{ round, present, vac.steps, vac.moved, vs.before, vs.after, vs.moved });
+            std.debug.print("round {d}: ok, {d} keys, {d} vacuum steps moved {d} pages, vacuum {d} -> {d} pages, {d} moved, {d} checkpoints wrote {d} pages\n", .{
+                round, present, vac.steps, vac.moved, vs.before, vs.after, vs.moved, ckpt.n, ckpt.written,
+            });
         }
         std.debug.print("stress test passed: {d} threads, {d} ops each, {d} rounds, {d} retries\n", .{ sh.threads, sh.ops, rounds, sh.retries.raw });
     } else if (std.mem.eql(u8, mode, "bench")) {
@@ -754,7 +787,7 @@ pub fn main(init: std.process.Init) !void {
         try online(&t, io, gpa, &sh, @intCast(try arg(args, 3, 256)), @intCast(try arg(args, 4, 25)));
     } else if (std.mem.eql(u8, mode, "walgrow")) {
         var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 4, 50), .ops = 0 };
-        try walGrow(&t, io, gpa, &sh, f, try arg(args, 3, 10));
+        try walGrow(&t, io, gpa, &sh, f, try arg(args, 3, 10), args.len > 5 and std.mem.eql(u8, args[5], "ckpt"));
     } else if (std.mem.eql(u8, mode, "scanmix")) {
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
@@ -768,7 +801,7 @@ pub fn main(init: std.process.Init) !void {
             " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>" ++
             " | stress shrink [keep%] [truncate|full|pages] | stress vaccrash <file> <seed> <ms>" ++
             " | stress online [threads] [step] [busy%] [read%] | stress onlinecrash <file> <seed> <ms>" ++
-            " | stress walgrow [threads] [seconds] [read%]\n", .{});
+            " | stress walgrow [threads] [seconds] [read%] [ckpt]\n", .{});
         return error.BadArgs;
     }
 }
