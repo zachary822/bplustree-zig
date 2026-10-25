@@ -32,6 +32,7 @@ comptime {
 const meta_pgno = 0;
 const magic = "BPTOVF01";
 const meta_size = 32;
+pub const default_ckpt_bytes = 4 << 20;
 
 /// The errors that the tree gives, in addition to the I/O errors.
 pub const Error = error{ BadFile, KeyTooLarge, ValueTooLarge, PoolExhausted, NoSpaceLeft };
@@ -743,6 +744,8 @@ pub const BPTree = struct {
     gate: Io.RwLock = .init,
     ckpt_mu: Io.Mutex = .init,
     durable: bool = true,
+    ckpt_bytes: u64 = default_ckpt_bytes,
+    checkpoints: std.atomic.Value(u64) = .init(0),
     pending: ?Checkpoint = null,
 
     const Checkpoint = struct {
@@ -801,9 +804,23 @@ pub const BPTree = struct {
     };
 
     pub fn checkpoint(self: *BPTree) !CheckpointStats {
+        self.ckpt_mu.lockUncancelable(self.pool.io);
+        defer self.ckpt_mu.unlock(self.pool.io);
+        return self.checkpointLocked();
+    }
+
+    fn autoCheckpoint(self: *BPTree) void {
+        if (self.ckpt_bytes == 0) return;
+        const wal = &self.pool.wal;
+        const start = wal.start.load(.acquire);
+        if (wal.end.load(.acquire) -| start < self.ckpt_bytes) return;
+        if (!self.ckpt_mu.tryLock()) return;
+        defer self.ckpt_mu.unlock(self.pool.io);
+        _ = self.checkpointLocked() catch {};
+    }
+
+    fn checkpointLocked(self: *BPTree) !CheckpointStats {
         const io = self.pool.io;
-        self.ckpt_mu.lockUncancelable(io);
-        defer self.ckpt_mu.unlock(io);
         const dirty = try self.gpa.alloc(u32, pool_frames);
         defer self.gpa.free(dirty);
 
@@ -823,6 +840,7 @@ pub const BPTree = struct {
         const written = try self.writePages(dirty[0..n]);
         try self.checkpointEnd(ck);
         self.pending = null;
+        _ = self.checkpoints.fetchAdd(1, .monotonic);
         return .{ .written = written, .pause_ns = pause_ns };
     }
 
@@ -1600,6 +1618,7 @@ pub const BPTree = struct {
     pub fn put(self: *BPTree, key: []const u8, val: []const u8) !void {
         if (key.len > max_key) return error.KeyTooLarge;
         if (val.len > max_val) return error.ValueTooLarge;
+        defer self.autoCheckpoint();
         self.gate.lockSharedUncancelable(self.pool.io);
         defer self.gate.unlockShared(self.pool.io);
         const local = localSize(val.len);
@@ -1716,6 +1735,7 @@ pub const BPTree = struct {
 
     pub fn delete(self: *BPTree, key: []const u8) !bool {
         if (key.len > max_key) return error.KeyTooLarge;
+        defer self.autoCheckpoint();
         self.gate.lockSharedUncancelable(self.pool.io);
         defer self.gate.unlockShared(self.pool.io);
         var op: Op = .{};
@@ -2276,6 +2296,7 @@ test "BPTree sync starts a new run and empties the file of the run before" {
     defer closeTestLog(log);
     var t: BPTree = try .init(std.testing.allocator, io, file, log);
     defer t.deinit();
+    t.ckpt_bytes = 0;
 
     var kbuf: [16]u8 = undefined;
     for (0..3) |_| {
@@ -2320,6 +2341,7 @@ test "BPTree recovery reads the run after a checkpoint that did not end" {
     {
         var t: BPTree = try .init(std.testing.allocator, io, file, log);
         defer t.deinit();
+        t.ckpt_bytes = 0;
         e = t.pool.wal.epoch;
         try testPut(&t, N, "one");
         // A checkpoint starts run e + 1, and then the process crashes before the meta page.
@@ -2585,6 +2607,34 @@ test "BPTree crash right after a checkpoint" {
         const got = try t.get(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{i}), &out);
         if (i < N * 3 / 4) try std.testing.expectEqual(null, got) else try std.testing.expectEqualStrings("one", got.?);
     }
+}
+
+test "BPTree automatic checkpoints keep the log short" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try createTestFile(tmp.dir);
+    defer file.close(io);
+    const log = try createTestLog(tmp.dir);
+    defer closeTestLog(log);
+    const limit = 64 * (Wal.rec_hdr + page_size);
+    const N = 3000;
+    {
+        var t: BPTree = try .init(std.testing.allocator, io, file, log);
+        defer t.deinit();
+        t.ckpt_bytes = limit;
+        for (0..4) |round| {
+            var vbuf: [8]u8 = undefined;
+            try testPut(&t, N, try std.fmt.bufPrint(&vbuf, "v{d}", .{round}));
+            // An operation that starts a checkpoint ran when the run had at least `limit` bytes. One operation
+            // logs at most `max_changed` pages, so no file can have much more.
+            for (log) |l| try std.testing.expect(try l.length(io) < limit + (max_changed + 1) * (Wal.rec_hdr + page_size));
+        }
+        try std.testing.expect(t.checkpoints.load(.monotonic) > 4);
+    }
+    var t: BPTree = try .init(std.testing.allocator, io, file, log);
+    defer t.deinit();
+    try testExpect(&t, N, "v3");
 }
 
 test "BPTree recovers values with chains after a crash" {
@@ -3614,6 +3664,7 @@ test "BPTree failed operation does not change the tree" {
     defer closeTestLog(log);
     var t: BPTree = try .init(std.testing.allocator, std.testing.io, file, log);
     defer t.deinit();
+    t.ckpt_bytes = 0;
 
     var kbuf: [16]u8 = undefined;
     var out: [max_local]u8 = undefined;

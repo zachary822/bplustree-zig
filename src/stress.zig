@@ -7,7 +7,7 @@
 //!   stress vaccrash <file> <seed> <ms>
 //!   stress online [threads] [step] [busy percent] [read percent]
 //!   stress onlinecrash <file> <seed> <ms>
-//!   stress walgrow [threads] [seconds] [read percent] [ckpt]
+//!   stress walgrow [threads] [seconds] [read percent] [none | ckpt | auto]
 const std = @import("std");
 const Io = std.Io;
 const bpt = @import("bplustree_zig");
@@ -345,11 +345,14 @@ fn online(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, step: u32
     try t.check();
 }
 
+/// How `walgrow` keeps the log short: not at all, with a checkpoint each second, or with automatic checkpoints.
+const GrowMode = enum { none, ckpt, auto };
+
 /// Loads `bench_keys` keys and syncs. Then `threads` threads get and put keys for `secs` seconds, and nothing
-/// calls `sync`. It prints the size of the log after each second. With `ckpt`, it then runs a checkpoint and
+/// calls `sync`. It prints the size of the log after each second. With `.ckpt`, it then runs a checkpoint and
 /// prints what it did. At the end it calls `sync` while the threads still run, and prints how long the sync took
 /// and the latencies of the operations around it.
-fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files, secs: usize, ckpt: bool) !void {
+fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files, secs: usize, mode: GrowMode) !void {
     var kbuf: [16]u8 = undefined;
     var vbuf: [max_test_val]u8 = undefined;
     t.durable = false;
@@ -359,14 +362,16 @@ fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files
     sh.lats = try gpa.alloc(Lat, sh.threads);
     defer gpa.free(sh.lats);
     @memset(sh.lats, .{});
+    if (mode != .auto) t.ckpt_bytes = 0;
+    const ckpts = t.checkpoints.load(.monotonic);
 
     const th = try runInBackground(onlineWorker, sh, 5);
     var start = Io.Clock.Timestamp.now(io, .awake);
     for (1..secs + 1) |s| {
         try io.sleep(.fromSeconds(1), .awake);
         const log_kb = try f.logLength(io) / 1024;
-        if (!ckpt) {
-            std.debug.print("second {d}: log_kb={d}\n", .{ s, log_kb });
+        if (mode != .ckpt) {
+            std.debug.print("second {d}: log_kb={d} checkpoints={d}\n", .{ s, log_kb, t.checkpoints.load(.monotonic) - ckpts });
             continue;
         }
         const c = try t.checkpoint();
@@ -374,7 +379,7 @@ fn walGrow(t: *bpt.BPTree, io: Io, gpa: std.mem.Allocator, sh: *Shared, f: Files
             s, log_kb, c.written, c.pause_ns / std.time.ns_per_us, try f.logLength(io) / 1024,
         });
     }
-    printLat(if (ckpt) "with checkpoints" else "no checkpoint", sh, @intCast(start.untilNow(io).raw.toNanoseconds()));
+    printLat(@tagName(mode), sh, @intCast(start.untilNow(io).raw.toNanoseconds()));
     // The latencies from here on are of the operations around the sync.
     @memset(sh.lats, .{});
     start = Io.Clock.Timestamp.now(io, .awake);
@@ -570,6 +575,8 @@ fn crash(io: Io, gpa: std.mem.Allocator, path: []const u8, seed: u64, ms: u64) !
     for (0..test_keys) |k| try t.put(keyOf(&kbuf, k), makeVal(&vbuf, k, 1));
     try t.sync();
     t.durable = true;
+    // Many checkpoints, so that the crash often comes in the middle of one.
+    t.ckpt_bytes = 256 << 10;
     for (0..crash_threads) |id| _ = try std.Thread.spawn(.{}, crashWorker, .{ &t, id, seed + id });
     try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
     // Like a crash of the process: no sync, no deinit, and the threads stop wherever they are.
@@ -787,7 +794,8 @@ pub fn main(init: std.process.Init) !void {
         try online(&t, io, gpa, &sh, @intCast(try arg(args, 3, 256)), @intCast(try arg(args, 4, 25)));
     } else if (std.mem.eql(u8, mode, "walgrow")) {
         var sh: Shared = .{ .t = &t, .threads = try arg(args, 2, 4), .read_pct = try arg(args, 4, 50), .ops = 0 };
-        try walGrow(&t, io, gpa, &sh, f, try arg(args, 3, 10), args.len > 5 and std.mem.eql(u8, args[5], "ckpt"));
+        const gmode = if (args.len > 5) std.meta.stringToEnum(GrowMode, args[5]) orelse return error.BadArgs else .none;
+        try walGrow(&t, io, gpa, &sh, f, try arg(args, 3, 10), gmode);
     } else if (std.mem.eql(u8, mode, "scanmix")) {
         var kbuf: [16]u8 = undefined;
         const val: [50]u8 = @splat('v');
@@ -801,7 +809,7 @@ pub fn main(init: std.process.Init) !void {
             " | stress scanmix [scan%] [update%] [ops] [nosync] | stress crash <file> <seed> <ms> | stress verify <file>" ++
             " | stress shrink [keep%] [truncate|full|pages] | stress vaccrash <file> <seed> <ms>" ++
             " | stress online [threads] [step] [busy%] [read%] | stress onlinecrash <file> <seed> <ms>" ++
-            " | stress walgrow [threads] [seconds] [read%] [ckpt]\n", .{});
+            " | stress walgrow [threads] [seconds] [read%] [none|ckpt|auto]\n", .{});
         return error.BadArgs;
     }
 }
