@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const crc32 = @import("crc32.zig");
 
 const page_size = build_options.page_size;
 const pool_frames = build_options.pool_frames;
@@ -52,6 +53,26 @@ fn put16(p: []u8, v: u16) void {
 
 fn put32(p: []u8, v: u32) void {
     std.mem.writeInt(u32, p[0..4], v, .little);
+}
+
+/// `std.mem.lessThan` for keys. It compares 8 bytes at a time: a big-endian word orders like its bytes.
+/// std.mem.order compares one byte at a time, and keys often share a long prefix.
+fn keyLess(a: []const u8, b: []const u8) bool {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const x = std.mem.readInt(u64, a[i..][0..8], .big);
+        const y = std.mem.readInt(u64, b[i..][0..8], .big);
+        if (x != y) return x < y;
+    }
+    if (i + 4 <= n) {
+        const x = std.mem.readInt(u32, a[i..][0..4], .big);
+        const y = std.mem.readInt(u32, b[i..][0..4], .big);
+        if (x != y) return x < y;
+        i += 4;
+    }
+    while (i < n) : (i += 1) if (a[i] != b[i]) return a[i] < b[i];
+    return a.len < b.len;
 }
 
 /// A stack that keeps at most `cap` items inline.
@@ -145,7 +166,7 @@ const Wal = struct {
     }
 
     fn crc(rec: []const u8) u32 {
-        return std.hash.Crc32.hash(rec[4..]);
+        return crc32.hash(rec[4..]);
     }
 
     fn file(self: *Wal) Io.File {
@@ -700,6 +721,21 @@ const Op = struct {
     lsn: u64 = 0,
     old_chain: u32 = 0,
 
+    /// Sets only the counters. `Op = .{}` would also zero all 46 KB of the buffers, on every operation,
+    /// and a function that returns an `Op` copies it.
+    fn init(op: *Op) void {
+        op.held.len = 0;
+        op.top = 0;
+        op.root_latch = null;
+        op.reserved.len = 0;
+        op.spares = 0;
+        op.scratch.reset();
+        op.changed.len = 0;
+        op.freed.len = 0;
+        op.lsn = 0;
+        op.old_chain = 0;
+    }
+
     fn owns(op: *const Op, p: Page) bool {
         for (op.held.items()[op.top..]) |h| if (h.page.page == p.page) return true;
         for (op.reserved.items()) |r| if (r.page == p.page) return true;
@@ -903,7 +939,7 @@ pub const BPTree = struct {
         put32(buf[16..], ck.root);
         put32(buf[20..], ck.npages);
         put32(buf[24..], ck.freelist);
-        put32(buf[28..], std.hash.Crc32.hash(buf[0..28]));
+        put32(buf[28..], crc32.hash(buf[0..28]));
         try self.pool.file.writePositionalAll(self.pool.io, &buf, ck.epoch % 2 * (page_size / 2));
     }
 
@@ -914,7 +950,7 @@ pub const BPTree = struct {
         for ([_]usize{ 0, page_size / 2 }) |off| {
             const m = page[off..][0..meta_size];
             if (!std.mem.eql(u8, magic, m[0..magic.len]) or get32(m[8..]) != page_size) continue;
-            if (get32(m[28..]) != std.hash.Crc32.hash(m[0..28])) continue;
+            if (get32(m[28..]) != crc32.hash(m[0..28])) continue;
             if (best == null or get32(m[12..]) > get32(best.?[12..])) best = m;
         }
         const m = best orelse return error.BadFile;
@@ -1420,7 +1456,8 @@ pub const BPTree = struct {
         if (key.len > max_key) return error.KeyTooLarge;
         self.gate.lockSharedUncancelable(self.pool.io);
         defer self.gate.unlockShared(self.pool.io);
-        var op: Op = .{};
+        var op: Op = undefined;
+        op.init();
         const path = try self.descend(&op, key, .read);
         defer self.releaseHeld(&op);
         const leaf = path.leaf();
@@ -1603,7 +1640,8 @@ pub const BPTree = struct {
         const first = if (local < val.len) try self.writeChain(val[local..]) else 0;
         var c: [max_leaf_cell]u8 = undefined;
         const cell = if (first == 0) makeLeafCell(&c, key, val) else makeOverflowCell(&c, key, val.len, val[0..local], first);
-        var op: Op = .{};
+        var op: Op = undefined;
+        op.init();
         self.putCell(&op, key, cell) catch |err| {
             if (first != 0) try self.freeChain(first, 0);
             return err;
@@ -1710,7 +1748,8 @@ pub const BPTree = struct {
         defer self.autoCheckpoint();
         self.gate.lockSharedUncancelable(self.pool.io);
         defer self.gate.unlockShared(self.pool.io);
-        var op: Op = .{};
+        var op: Op = undefined;
+        op.init();
         const found = try self.deleteIn(&op, key, .optimistic) orelse (try self.deleteIn(&op, key, .write)).?;
         try self.endWrite(&op);
         return found;
@@ -1737,7 +1776,8 @@ pub const BPTree = struct {
         const use_ring = ring_frames > 0 and @atomicLoad(u32, &self.npages, .monotonic) > pool_frames / 4;
 
         restart: while (true) {
-            var op: Op = .{};
+            var op: Op = undefined;
+            op.init();
             const path = try self.descend(&op, start, .read);
             _ = op.held.pop();
             self.releaseHeld(&op);
@@ -1751,7 +1791,7 @@ pub const BPTree = struct {
                 const first = i;
                 for (i..leaf.count()) |j| {
                     const k = leaf.cellKey(j);
-                    if (hi) |h| if (!std.mem.lessThan(u8, k, h)) return count;
+                    if (hi) |h| if (!keyLess(k, h)) return count;
                     const val = if (leaf.overflow(j) == 0) leaf.localVal(j) else blk: {
                         const len = leaf.valLen(j);
                         if (big.len < len) {
@@ -1826,9 +1866,9 @@ pub const BPTree = struct {
         if (pgno != self.root and p.usedBytes() < min_fill) return checkFail("page {d} is below min_fill", .{pgno});
         for (0..n) |i| {
             const k = p.cellKey(i);
-            if (i > 0 and !std.mem.lessThan(u8, p.cellKey(i - 1), k))
+            if (i > 0 and !keyLess(p.cellKey(i - 1), k))
                 return checkFail("page {d}: keys out of order", .{pgno});
-            if (lo != null and std.mem.lessThan(u8, k, lo.?) or hi != null and !std.mem.lessThan(u8, k, hi.?))
+            if (lo != null and keyLess(k, lo.?) or hi != null and !keyLess(k, hi.?))
                 return checkFail("page {d}: key outside its parent's range", .{pgno});
         }
         switch (p.kind()) {
@@ -2003,7 +2043,7 @@ const Page = struct {
         var hi: usize = n;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            if (std.mem.lessThan(u8, self.cellKey(mid), key)) {
+            if (keyLess(self.cellKey(mid), key)) {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -2159,6 +2199,25 @@ const CellList = struct {
         return best.?;
     }
 };
+
+test {
+    _ = crc32;
+}
+
+test keyLess {
+    var prng: std.Random.DefaultPrng = .init(1);
+    const r = prng.random();
+    var a: [40]u8 = undefined;
+    var b: [40]u8 = undefined;
+    for (0..100_000) |_| {
+        for (&a) |*x| x.* = 'a' + r.uintLessThan(u8, 2);
+        b = a;
+        if (r.boolean()) b[r.uintLessThan(usize, a.len)] = 'a' + r.uintLessThan(u8, 3);
+        const la = r.uintAtMost(usize, a.len);
+        const lb = r.uintAtMost(usize, b.len);
+        try std.testing.expectEqual(std.mem.lessThan(u8, a[0..la], b[0..lb]), keyLess(a[0..la], b[0..lb]));
+    }
+}
 
 fn createTestFile(dir: Io.Dir) !Io.File {
     return dir.createFile(std.testing.io, "test.bin", .{ .read = true });
@@ -2591,7 +2650,8 @@ test "BPTree freed chain page waits for the commit that freed it" {
     const big: [2 * ovfl_cap]u8 = @splat('b');
     try t.put("k", &big);
     try t.sync();
-    var op: Op = .{};
+    var op: Op = undefined;
+    op.init();
     const path = try t.descend(&op, "k", .read);
     const old = path.leaf().overflow(0);
     t.releaseHeld(&op);
@@ -2952,7 +3012,8 @@ test "BPTree page alloc" {
     try std.testing.expectEqual(.leaf, a.kind());
     try std.testing.expectEqual(3, t.npages);
 
-    var op: Op = .{};
+    var op: Op = undefined;
+    op.init();
     op.reserved.push(a);
     op.pageFree(a);
     try std.testing.expectEqual(0, t.freelist);
@@ -3152,7 +3213,8 @@ test "BPTree get" {
     const long_key: [max_key + 1]u8 = @splat('k');
     try std.testing.expectError(error.KeyTooLarge, t.get(&long_key, &buf));
 
-    var op: Op = .{};
+    var op: Op = undefined;
+    op.init();
     const path = try t.descend(&op, "z", .write);
     defer t.releaseHeld(&op);
     try std.testing.expectEqual(1, path.depth);
@@ -3594,7 +3656,8 @@ test "BPTree pool lock count" {
     // The even keys are in the tree. Most puts of an odd key do not split.
     for (0..2000) |k| try t.put(try std.fmt.bufPrint(&kbuf, "key{d:0>8}", .{2 * k}), &val);
 
-    var op: Op = .{};
+    var op: Op = undefined;
+    op.init();
     const levels = (try t.descend(&op, "key", .read)).depth + 1;
     t.releaseHeld(&op);
 
